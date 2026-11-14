@@ -18,8 +18,7 @@ from agent.runtime.paper_contract import configure_paper_observed_contract
 from agent.runtime.quantized_mask_table import QuantizedSharedBitTable
 from agent.runtime.observed_write_reservation import ObservedWriteReservationHooks
 from agent.runtime.single_writer_grace_20261109 import install
-from scripts.revision.progressive_agent_environment_20261109 import ObservedBoundaryHooks
-from scripts.revision.run_revision_supplement_20261110 import FrozenStatic
+from agent.runtime.observed_boundary_hooks import ObservedBoundaryHooks
 from scripts.revision import compare_frozen_credit_trace as replay
 from scripts.revision.bridge_profile import ExclusiveClock,instrument_manager
 from scripts.revision.audit_serial_history import verify_history
@@ -47,7 +46,13 @@ def main():
     replay.RecordingPolicy=Recorder;rows=[]
     for arm in args.arms:
         model=args.model_dir/('nophase_int16_table.json' if arm=='nophase' else 'full_int16_table.json')
-        policy=FrozenStatic() if arm=='static' else QuantizedSharedBitTable(json.loads(model.read_text())) if arm in ['full','nophase'] else None
+        if arm == 'static':
+            from scripts.revision.run_revision_supplement_20261110 import FrozenStatic
+            policy = FrozenStatic()
+        elif arm in ['full', 'nophase']:
+            policy = QuantizedSharedBitTable(json.loads(model.read_text()))
+        else:
+            policy = None
         clock=ExclusiveClock();profile={};attempts=[];decisions=[];refs={};changes=[]
         system={'silo':'silo','2pl':'2pl-nowait'}.get(arm,'paper-atcc')
         if arm=='2pl':

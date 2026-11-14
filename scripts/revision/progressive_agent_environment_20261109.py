@@ -19,32 +19,12 @@ import time
 ROOT=Path(__file__).resolve().parents[2];sys.path.insert(0,str(ROOT))
 from agent.runtime import AgentTransactionManager
 from agent.runtime.context import LockAction,LockClass,TransactionPhase,TransactionStatus
+from agent.runtime.observed_boundary_hooks import ObservedBoundaryHooks
 from agent.runtime.quantized_mask_table import QuantizedSharedBitTable
 
 CAPTURE=ROOT/'revision_experiments/real_credit_live_small_20261102.json'
 OBSERVED_LLM={phase:[float(e['duration_ms']) for task in json.loads(CAPTURE.read_text())['tasks']
     for e in task['events'] if e['event']=='llm' and e.get('phase')==phase] for phase in ['explore','refine']}
-
-
-class ObservedBoundaryHooks:
-    """Current issued phase boundary plus ordinary observed round checkpoints.
-
-    Reduces repeated resampling within one straight-line tool block. No future
-    object set/duration is exposed; the same scheduler applies to NoPhase.
-    """
-    def __init__(self,delegate):self.delegate=delegate
-    def __getattr__(self,name):return getattr(self.delegate,name)
-    def checkpoint(self,tx):
-        phase=tx.context.phase.value
-        if self.delegate.enabled(tx) and tx.metadata.get('_progressive_issued_phase')!=phase:
-            tx.metadata['_progressive_issued_phase']=phase
-            self.delegate._decide(tx,'current-issued-phase-tool-boundary')
-    def before_read(self,tx,key):
-        self.checkpoint(tx)
-        return self.delegate.before_read(tx,key)
-    def before_write(self,tx,key):
-        self.checkpoint(tx)
-        return self.delegate.before_write(tx,key)
 
 
 def percentile(xs,q):
