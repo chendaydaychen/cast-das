@@ -3,6 +3,8 @@
 #include <pybind11/stl.h>
 
 #include <vector>
+#include <stdexcept>
+#include <utility>
 
 #include "core/intent/intent.h"
 #include "core/object/unified_object.h"
@@ -97,5 +99,32 @@ PYBIND11_MODULE(cast_core, m) {
            py::arg("max_value_bytes") = 8192,
            py::arg("bucket_count") = 4096);
   m.attr("VersionedObjectStore") = m.attr("Dbx1000VersionedKVStore");
+
+  // Each tuple holds (native engine, expected-version checks, writes).
+  m.def("batch_put_across_stores",
+        [](const std::vector<py::tuple>& entries) {
+          std::vector<storage::Dbx1000VersionedKVStore::StoreBatch> batches;
+          batches.reserve(entries.size());
+          for (const auto& entry : entries) {
+            if (entry.size() != 3) {
+              throw std::invalid_argument("expected (store, checks, writes)");
+            }
+            auto* engine = entry[0].cast<storage::Dbx1000VersionedKVStore*>();
+            std::vector<storage::VersionCheck> checks;
+            for (const auto& check : entry[1].cast<
+                     std::vector<std::pair<std::string, std::uint64_t>>>()) {
+              checks.push_back({check.first, check.second});
+            }
+            std::vector<storage::WriteOp> writes;
+            for (const auto& write : entry[2].cast<
+                     std::vector<std::pair<std::string, std::string>>>()) {
+              writes.push_back({write.first, write.second});
+            }
+            batches.push_back({engine, std::move(checks), std::move(writes)});
+          }
+          py::gil_scoped_release release;
+          return storage::Dbx1000VersionedKVStore::BatchAcrossStores(
+              std::move(batches));
+        });
 
 }

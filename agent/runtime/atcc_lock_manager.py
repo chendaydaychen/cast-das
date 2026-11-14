@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import threading
 import time
 from collections import defaultdict
@@ -77,6 +78,10 @@ class PaperATCCLockManager:
         self._native_diagnostics: Dict[str, float] = defaultdict(float)
         self._lock_acquires_by_phase: Dict[str, int] = defaultdict(int)
         self._wound_events: List[dict[str, object]] = []
+        self.record_wait_snapshots = False
+        self.refresh_priorities_before_wound = False
+        self._priority_comparisons: List[dict[str, object]] = []
+        self._wait_snapshots: List[dict[str, object]] = []
 
     def register(self, context: TransactionContext) -> None:
         with self._condition:
@@ -95,6 +100,45 @@ class PaperATCCLockManager:
                 raise RuntimeError(f"duplicate live transaction id: {context.tid}")
             self._contexts[context.tid] = context
 
+    def read_after_foreign_writers(
+        self, object_id: str, context: TransactionContext, read_committed: Callable[[], Any],
+        *, timeout_s: float = 5.0,
+    ) -> Any:
+        """Opt-in blocking-OCC-read control, NOT an acquired pessimistic RLock.
+
+        Wait for foreign write ownership/publication to finish, then copy the
+        committed value under the metadata latch. No read ownership survives
+        this call; ordinary OCC commit validation is still required. The queue
+        entry permits cancellation/wait accounting but never wounds a holder.
+        Normal Aegis reads do not call this method.
+        """
+        if isinstance(timeout_s,bool) or not math.isfinite(float(timeout_s)) or float(timeout_s)<0:
+            raise ValueError('Finite nonnegative blocking read timeout required')
+        key=str(object_id);deadline=time.perf_counter()+float(timeout_s)
+        with self._condition:
+            self.register(context)
+            request=None
+            try:
+                while True:
+                    if request is not None:self._ensure_live(request,key)
+                    elif context.status not in (TransactionStatus.ACTIVE,TransactionStatus.WAITING):
+                        raise LockConflict('inactive blocking OCC reader',(key,),kind='lock-preempted')
+                    meta=self._objects[key]
+                    writer=self._live_context(meta.writer)
+                    blockers=([writer] if writer is not None and writer.tid!=context.tid else [])
+                    blockers.extend(self._publishers_for_key_locked(key,exclude_tid=context.tid))
+                    if not blockers:
+                        result=read_committed()
+                        self._diagnostics['blocking_occ_read_copies']+=1
+                        return result
+                    if request is None:
+                        request=self._enqueue(key,context,'read')
+                        self._diagnostics['blocking_occ_read_waits']+=1
+                    self._wait(request,context,deadline,key,blockers=blockers)
+            finally:
+                if request is not None:self._dequeue(self._objects[key],request)
+                self._condition.notify_all()
+
     def validate_and_rlock(
         self,
         object_id: str,
@@ -103,13 +147,31 @@ class PaperATCCLockManager:
         current_version: Callable[[], int],
         *,
         timeout_s: float = 5.0,
+        refresh_unobserved_snapshot: Callable[[], None] | None = None,
     ) -> float:
         key = str(object_id)
         started = time.perf_counter()
         deadline = started + max(0.0, float(timeout_s))
         with self._condition:
             self.register(context)
-            if int(current_version()) != int(observed_version):
+            if refresh_unobserved_snapshot is not None and (
+                key in context.read_versions or key in context.write_targets
+                or context.snapshot_epoch >= 0
+            ):
+                raise ValueError("fresh RLock requires an unobserved, unpinned object")
+            if refresh_unobserved_snapshot is not None:
+                meta = self._objects[key]
+                if (
+                    (meta.writer and meta.writer != context.tid)
+                    or self._publishers_for_key_locked(key, exclude_tid=context.tid)
+                    or any(self._request_live(request) for request in meta.waiters)
+                ):
+                    # Refresh only at an immediately available read point.
+                    # Never turn an old-value validation failure into a new
+                    # blocking dependency across a held helper reservation.
+                    refresh_unobserved_snapshot = None
+                    self._diagnostics["fresh_unobserved_read_contended_fallbacks"] += 1
+            if refresh_unobserved_snapshot is None and int(current_version()) != int(observed_version):
                 self._note_contention(key, "validation-failure")
                 raise LockConflict(
                     f"retroactive validation failed on {key}",
@@ -135,7 +197,7 @@ class PaperATCCLockManager:
                     blocker = writer if writer is not None and writer.tid != context.tid else publisher
                     if blocker is None:
                         if self._is_front(meta, request):
-                            if int(current_version()) != int(observed_version):
+                            if refresh_unobserved_snapshot is None and int(current_version()) != int(observed_version):
                                 self._note_contention(key, "validation-failure")
                                 raise LockConflict(
                                     f"retroactive validation failed on {key}",
@@ -144,6 +206,18 @@ class PaperATCCLockManager:
                                 )
                             meta.readers.add(context.tid)
                             context.held_read_locks.add(key)
+                            if refresh_unobserved_snapshot is not None:
+                                # Every writer/publisher was excluded above.
+                                # Only now may a value never exposed to the
+                                # Agent be materialized at this read's point.
+                                try:
+                                    refresh_unobserved_snapshot()
+                                except BaseException:
+                                    meta.readers.discard(context.tid)
+                                    context.held_read_locks.discard(key)
+                                    self._condition.notify_all()
+                                    raise
+                                self._diagnostics["fresh_unobserved_read_acquires"] += 1
                             self._note_acquired(context)
                             self._diagnostics["read_lock_acquires"] += 1
                             self._lock_acquires_by_phase[f"{context.phase.value}:read"] += 1
@@ -435,6 +509,8 @@ class PaperATCCLockManager:
         """
         if not context.is_background:
             raise ValueError("background publish fast path requires a background transaction")
+        if getattr(self,'strict_read_protection',False):
+            allow_reader_bypass=False
         admission_started = time.perf_counter()
         keys = tuple(sorted(set(str(value) for value in object_ids)))
         key_coverage = frozenset(keys)
@@ -685,6 +761,8 @@ class PaperATCCLockManager:
         *,
         allow_reader_bypass: bool = False,
     ) -> bool:
+        if getattr(self,'strict_read_protection',False):
+            allow_reader_bypass=False
         key = str(object_id)
         if self._publishers_for_key_locked(key):
             return True
@@ -893,6 +971,34 @@ class PaperATCCLockManager:
                 "waiters": tuple(request.tid for request in sorted(meta.waiters, key=lambda item: item.order)),
             }
 
+    def wait_dependencies_snapshot(self) -> dict[str, set[str]]:
+        """Read-only dependencies across ALL queued keys, including WriteSets.
+
+        Used only by the opt-in helper cycle detector. A single context's
+        pending_request field cannot describe atomic multi-key admission.
+        Callers must not hold a helper condition while taking this snapshot.
+        """
+        with self._condition:
+            graph: dict[str, set[str]] = defaultdict(set)
+            for tid, requests in self._requests_by_tid.items():
+                for request in requests:
+                    if not self._request_live(request):
+                        continue
+                    key = request.object_id
+                    meta = self._objects[key]
+                    if request.mode == "read":
+                        blockers = self._publishers_for_key_locked(key, exclude_tid=tid)
+                        writer = self._live_context(meta.writer)
+                        if writer is not None and writer.tid != tid:
+                            blockers.append(writer)
+                    else:
+                        blockers = self._write_blockers(key, meta, request.context)
+                    graph[tid].update(blocker.tid for blocker in blockers)
+                    preceding = [other for other in meta.waiters
+                        if self._request_live(other) and other.tid != tid and other.order < request.order]
+                    graph[tid].update(other.tid for other in preceding)
+            return dict(graph)
+
     def global_waiter_count(self) -> int:
         return self._waiter_count
 
@@ -925,6 +1031,8 @@ class PaperATCCLockManager:
                 **native_diagnostics,
                 "lock_acquires_by_phase": dict(sorted(self._lock_acquires_by_phase.items())),
                 "wound_events": tuple(dict(event) for event in self._wound_events),
+                "priority_comparisons": tuple(dict(event) for event in self._priority_comparisons),
+                "wait_snapshots": tuple(dict(event) for event in self._wait_snapshots),
                 "current_waiters": self._waiter_count,
                 "live_contexts": len(self._contexts),
                 "live_contexts_by_status": dict(sorted(live_by_status.items())),
@@ -936,9 +1044,11 @@ class PaperATCCLockManager:
         with self._native_diagnostics_lock:
             self._native_diagnostics.clear()
         with self._condition:
+            self._priority_comparisons.clear()
             self._diagnostics.clear()
             self._lock_acquires_by_phase.clear()
             self._wound_events.clear()
+            self._wait_snapshots.clear()
 
     def has_foreign_committing_writer(
         self,
@@ -1122,11 +1232,31 @@ class PaperATCCLockManager:
         # Aegis compares the paper's lexicographic (priority, startTS) order.
         # Priority is monotonic within an attempt, and pending requests are
         # re-evaluated when their priority epoch changes.
+        if self.refresh_priorities_before_wound and self._priority_callback is not None:
+            before = (int(requester.priority), int(holder.priority))
+            self.update_priority(requester, self._priority_callback(requester))
+            self.update_priority(holder, self._priority_callback(holder))
+            if len(self._priority_comparisons) < 2048:
+                self._priority_comparisons.append(dict(requester=requester.tid, holder=holder.tid,
+                    requester_before=before[0], holder_before=before[1],
+                    requester_after=int(requester.priority), holder_after=int(holder.priority),
+                    requester_inflight=bool(requester.inflight_agent_started_ns),
+                    holder_inflight=bool(holder.inflight_agent_started_ns)))
         return self._priority_order(requester) < self._priority_order(holder)
 
     @staticmethod
     def _priority_order(context: TransactionContext) -> tuple[int, int, str]:
         return (-int(context.priority), int(context.start_ts_ns), context.tid)
+
+    def synchronize_wound(self) -> None:
+        """Wait for any native wound callback and lock release to finish.
+
+        The attempt owner calls this after unwinding its lifecycle lock. Wound
+        status becomes visible before the callback publishes a result, so an
+        external reservation waiter cannot use status alone as completion.
+        """
+        with self._condition:
+            pass
 
     def _wound(
         self,
@@ -1195,6 +1325,7 @@ class PaperATCCLockManager:
             context.transition(TransactionStatus.WAITING)
         remaining = deadline - time.perf_counter()
         if remaining <= 0:
+            self._record_wait_snapshot(request, "timeout", blockers)
             if context.status == TransactionStatus.WAITING:
                 context.transition(TransactionStatus.ACTIVE)
             self._note_contention(key, "lock-timeout")
@@ -1202,6 +1333,8 @@ class PaperATCCLockManager:
             raise LockConflict(f"lock timeout on {key}", (key,), kind="lock-timeout")
         started = time.perf_counter()
         first_wait = request.waited_ms <= 0.0
+        if first_wait:
+            self._record_wait_snapshot(request, "first-wait", blockers)
         self._condition.wait(timeout=min(0.005, remaining))
         waited_ms = (time.perf_counter() - started) * 1000.0
         request.waited_ms += waited_ms
@@ -1226,6 +1359,23 @@ class PaperATCCLockManager:
             self.update_priority(context, self._priority_callback(context))
         if context.status == TransactionStatus.WAITING:
             context.transition(TransactionStatus.ACTIVE)
+
+    def _record_wait_snapshot(self, request, event, blockers):
+        if not self.record_wait_snapshots:
+            return
+        graph = self.wait_dependencies_snapshot()
+        self._wait_snapshots.append(dict(
+            event=event, at_ns=time.monotonic_ns(), requester=request.tid,
+            object_id=request.object_id, mode=request.mode,
+            blockers=sorted({context.tid for context in blockers if context is not None}),
+            wait_dependencies={tid: sorted(targets) for tid, targets in graph.items()},
+            contexts={tid: dict(status=context.status.value, priority=int(context.priority),
+                phase=context.phase.value, retry=int(context.retry_count),
+                held_reads=sorted(context.held_read_locks), held_writes=sorted(context.held_write_locks),
+                pending_request=context.pending_request)
+                for tid, context in self._contexts.items()}))
+        if len(self._wait_snapshots) > 256:
+            del self._wait_snapshots[:-256]
 
     def _note_contention(self, object_id: str, event: str, wait_ms: float = 0.0) -> None:
         if self._contention_callback is not None:

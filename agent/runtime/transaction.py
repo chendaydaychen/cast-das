@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import collections
+import math
 import threading
 import time
 from typing import Any, Dict, Iterable, Optional
@@ -96,6 +97,7 @@ class AgentTransaction:
                 LockClass(int(self.metadata.get("retry_protection_mask", 0) or 0) & 0xF)
             ),
             prior_retry_cost_ms=float(self.metadata.get("prior_retry_cost_ms", 0.0) or 0.0),
+            prior_retry_blocked_ms=max(0., float(self.metadata.get("prior_retry_blocked_ms", 0.0) or 0.0)),
             recent_conflict_kind=normalize_conflict_kind(
                 self.metadata.get("previous_failure_reason", "none")
             ),
@@ -112,6 +114,9 @@ class AgentTransaction:
         self.write_set: Dict[str, WriteRecord] = {}
         self.result: Optional[TransactionResult] = None
         self._lifecycle_lock = threading.RLock()
+        # Short metadata handshake only. Native wound callbacks must never
+        # acquire a foreign lifecycle lock or hold this gate over lock/IO work.
+        self._agent_work_gate = threading.RLock()
         self._event("begin", {"snapshot_objects": len(snapshot)})
 
     def _ensure_active(self) -> None:
@@ -128,6 +133,41 @@ class AgentTransaction:
         self.events.append(
             TransactionEvent(time.perf_counter() - self.started_at, kind, dict(detail or {}))
         )
+        if kind in {'read','write'} and getattr(self.manager,'paper_policy_refresh',None) is not None:
+            key=str(detail['object_id'])
+            value=self.snapshot[key].value if kind=='read' else self.write_set[key].value
+            initial=self.snapshot[key].value if kind=='read' else self.write_set[key].base_value
+            self.metadata.setdefault('_offline_replay_initial',{}).setdefault(key,str(initial))
+            previous=float(self.metadata.get('_offline_replay_agent_cost_ms',0.))
+            current=float(self.context.agent_cost_ms)
+            self.metadata['_offline_replay_agent_cost_ms']=current
+            route=self.manager.store.storage_id_for(key) if hasattr(self.manager.store,'storage_id_for') else 'default'
+            self.metadata.setdefault('_offline_replay_operations',[]).append(dict(kind=kind,key=key,
+                value=str(value),agent_gap_ms=max(0.,current-previous),storage_id=route))
+
+    def check_active(self) -> None:
+        """Check cancellation at an external-call boundary without holding a lock across it."""
+        with self._lifecycle_lock:
+            self._ensure_active()
+
+    def validate_observed_prefix(self) -> None:
+        """Conservatively reject stale observed reads before external paid work.
+
+        This acquires no protection and makes no claim about future writes.
+        Commit validation remains mandatory after this point-in-time check.
+        """
+        with self._lifecycle_lock:
+            self._ensure_active()
+            started = time.perf_counter()
+            stale = self.manager._conflict_targets(
+                (key, int(read.version)) for key, read in tuple(self.read_set.items()))
+            self.metadata['_prefix_validation_calls'] = int(
+                self.metadata.get('_prefix_validation_calls', 0)) + 1
+            self.metadata['_prefix_validation_ms'] = float(
+                self.metadata.get('_prefix_validation_ms', 0.)) + (time.perf_counter()-started)*1000
+            self._event('prefix-validation', dict(reads=len(self.read_set), stale=list(stale)))
+            if stale:
+                raise LockConflict('pre-expensive observed prefix is stale', stale, kind='version-conflict')
 
     def read(self, object_id: str) -> SnapshotValue:
         with self._lifecycle_lock:
@@ -150,7 +190,12 @@ class AgentTransaction:
                 elapsed_ms=(time.perf_counter() - operation_started) * 1000.0,
                 blocked_before_ms=blocked_before_ms,
             )
-            return snapshot
+            # Validation still refers to the committed base version, but a
+            # transaction must observe its own deferred/private writes. Never
+            # publish this value or replace the committed snapshot with it.
+            staged = self.write_set.get(key)
+            return (SnapshotValue(value=staged.value,version=snapshot.version,exists=True)
+                    if staged is not None else snapshot)
 
     def write(
         self,
@@ -158,6 +203,7 @@ class AgentTransaction:
         value: Any,
         *,
         metadata: Optional[Dict[str, Any]] = None,
+        replace_staged: bool = False,
     ) -> "AgentTransaction":
         with self._lifecycle_lock:
             operation_started = time.perf_counter()
@@ -166,7 +212,7 @@ class AgentTransaction:
             key = str(object_id)
             if key not in self.manager._catalog:
                 raise KeyError(f"object is not registered: {key}")
-            if key in self.write_set:
+            if key in self.write_set and not replace_staged:
                 raise ValueError(f"transaction already writes object: {key}")
             self._ensure_snapshot(key)
             self.manager.interceptor.before_write(self, key)
@@ -312,9 +358,9 @@ class AgentTransaction:
                 conflict_details=conflict_details,
                 retry_protection_mask=retry_mask,
             )
-            self.manager._note_runtime_outcome(self, False)
-            with self.manager._lock:
-                self.manager._paper_aborts += 1
+            if self.manager._note_runtime_outcome(self, False):
+                with self.manager._lock:
+                    self.manager._paper_aborts += 1
             self.manager._record(self)
             self.manager.interceptor.finish(self)
             self.manager.atcc_locks.release_all(self.context)
@@ -323,6 +369,27 @@ class AgentTransaction:
                 self.manager.version_manager.finish(self.context.tid, committed=False)
             self.manager._live_transactions.pop(self.context.tid, None)
             self.manager._finalize_commit_timing(self)
+            return self.result
+
+    def abort_or_observe_wound(
+        self, reason: str, *, strategy: str = "",
+        conflict_object_ids: Iterable[str] = (),
+    ) -> TransactionResult:
+        """Finish an owner failure or await an already claimed native wound.
+
+        Do not wait under the lifecycle lock or count a foreign abort twice.
+        This is for exception handlers after an operation has unwound; ordinary
+        abort() retains its existing active-transaction contract.
+        """
+        try:
+            return self.abort(reason, strategy=strategy,
+                              conflict_object_ids=conflict_object_ids)
+        except LockConflict as exc:
+            if exc.kind != "lock-preempted":
+                raise
+            self.manager.atcc_locks.synchronize_wound()
+            if self.result is None or self.result.committed:
+                raise RuntimeError('Native wound did not publish an aborted result') from exc
             return self.result
 
     def _result(
@@ -395,6 +462,7 @@ class AgentTransactionManager:
         self,
         *,
         store: Optional[Any] = None,
+        storage_engines: Optional[Dict[str, Any]] = None,
         cc_registry: Optional[ConcurrencyControlRegistry] = None,
         atcc_policy: Optional[Any] = None,
         record_traces: bool = True,
@@ -406,11 +474,88 @@ class AgentTransactionManager:
         performance_guards_enabled: bool = True,
         commit_admission_priority_enabled: bool = False,
         delayed_write_apply_enabled: bool = True,
+        policy_selected_write_admission_only: bool = False,
         priority_config: PriorityConfig | None = None,
         priority_enabled: bool = True,
+        tracked_history_import: bool = False,
+        conflict_driven_fast_path: bool = False,
+        unified_commit_admission: bool = False,
+        cycle_safe_hotspot_admission: bool = False,
+        cycle_safe_gate_wait_ms: float = 0.0,
+        coordinated_hotspot_admission: bool = False,
+        round_interval_features: bool = False,
+        commit_read_checkpoints: bool = False,
+        complete_category_read_protection: bool = False,
+        first_access_read_refresh: bool = False,
+        consistent_hotness_classification: bool = False,
+        exact_hotness_accounting: bool = False,
+        helper_externality_accounting: bool = False,
+        observed_write_read_lock_elision: bool = False,
+        cost_aware_read_elision: bool = False,
+        protection_relevant_hotness: bool = False,
+        defer_policy_protection_until_commit: bool = False,
+        deferred_object_plan_enabled: bool = False,
+        deferred_object_plan_min_redo_ms: float = 0.0,
+        unique_attempt_outcomes: bool = False,
     ):
-        self.store = store if store is not None else cc.Dbx1000VersionedKVStore()
-        self.version_manager = VersionManager(self.store)
+        if store is not None and storage_engines is not None:
+            raise ValueError("specify store or storage_engines, not both")
+        if storage_engines is not None:
+            from .storage_router import RoutedVersionedKVStore
+            self.store = RoutedVersionedKVStore(storage_engines)
+        else:
+            self.store = store if store is not None else cc.Dbx1000VersionedKVStore()
+        if undo_log_path and getattr(self.store, "owns_recovery", False):
+            raise ValueError("durable coordinated store owns recovery; do not layer the undo log")
+        self.version_manager = VersionManager(self.store,
+            tracked_history_import=tracked_history_import)
+        self.conflict_driven_fast_path = bool(conflict_driven_fast_path)
+        self.unified_commit_admission = bool(unified_commit_admission)
+        self.cycle_safe_hotspot_admission = bool(cycle_safe_hotspot_admission)
+        self.coordinated_hotspot_admission = bool(coordinated_hotspot_admission)
+        self.commit_read_checkpoints = bool(commit_read_checkpoints)
+        self.complete_category_read_protection = bool(complete_category_read_protection)
+        self.first_access_read_refresh = bool(first_access_read_refresh)
+        self.consistent_hotness_classification = bool(consistent_hotness_classification)
+        self.exact_hotness_accounting = bool(exact_hotness_accounting)
+        self.helper_externality_accounting = bool(helper_externality_accounting)
+        self.observed_write_read_lock_elision = bool(observed_write_read_lock_elision)
+        self.cost_aware_read_elision = bool(cost_aware_read_elision)
+        if self.cost_aware_read_elision and not self.observed_write_read_lock_elision:
+            raise ValueError('cost-aware read elision requires observed-write read-lock elision')
+        self.protection_relevant_hotness = bool(protection_relevant_hotness)
+        # Experimental scheduling mode.  A policy may nominate additional
+        # protection during explore/refine, but the nomination is materialized
+        # only at the short commit checkpoint.  Existing locks are never
+        # released, so the normal monotonic-lock invariant remains intact.
+        # This is deliberately opt-in; the paper runtime keeps its original
+        # immediate-install semantics.
+        self.defer_policy_protection_until_commit = bool(
+            defer_policy_protection_until_commit
+        )
+        if not math.isfinite(float(deferred_object_plan_min_redo_ms)) or float(deferred_object_plan_min_redo_ms) < 0:
+            raise ValueError("deferred object-plan redo threshold must be finite and nonnegative")
+        self.deferred_object_plan_enabled = bool(deferred_object_plan_enabled)
+        self.deferred_object_plan_min_redo_ms = float(deferred_object_plan_min_redo_ms)
+        self.unique_attempt_outcomes = bool(unique_attempt_outcomes)
+        self._runtime_outcomes_recorded = 0
+        self._runtime_duplicate_outcomes = 0
+        if self.protection_relevant_hotness and not self.observed_write_read_lock_elision:
+            raise ValueError("protection-relevant hotness requires observed-write read-lock elision")
+        if (getattr(paper_policy, "protection_relevant_hotness", False)
+                and not self.protection_relevant_hotness):
+            raise ValueError("policy requires protection-relevant hotness encoding")
+        self._observed_committed_write_objects: set[str] = set()
+        if self.helper_externality_accounting and not self.coordinated_hotspot_admission:
+            raise ValueError("helper externality accounting requires coordinated hotspot admission")
+        self.cycle_safe_gate_wait_ms = float(cycle_safe_gate_wait_ms)
+        if not math.isfinite(self.cycle_safe_gate_wait_ms) or self.cycle_safe_gate_wait_ms < 0:
+            raise ValueError("cycle-safe gate wait must be finite and non-negative")
+        if self.cycle_safe_gate_wait_ms and not self.cycle_safe_hotspot_admission:
+            raise ValueError("cycle-safe gate wait requires cycle-safe hotspot admission")
+        if sum((self.unified_commit_admission, self.cycle_safe_hotspot_admission,
+                self.coordinated_hotspot_admission)) > 1:
+            raise ValueError("Choose one hotspot admission mode, not both")
         self.cc_registry = cc_registry or ConcurrencyControlRegistry(atcc_policy=atcc_policy)
         self.exclusive_locks = ExclusiveLockTable()
         self.two_phase_locks = TwoPhaseLockTable()
@@ -426,7 +571,7 @@ class AgentTransactionManager:
         self._catalog: Dict[str, Any] = {}
         self._traces: list[Dict[str, Any]] = []
         self._record_traces = bool(record_traces)
-        self.state_collector = StateCollector()
+        self.state_collector = StateCollector(round_interval_features=round_interval_features)
         self.priority_manager = PriorityManager(priority_config)
         self.priority_enabled = bool(priority_enabled)
         self.hotness_tracker = HotnessTracker()
@@ -442,6 +587,7 @@ class AgentTransactionManager:
         # but buffer the private write and acquire its exact WLock only in the
         # short commit window. This remains an orthogonal ablation switch.
         self.delayed_write_apply_enabled = bool(delayed_write_apply_enabled)
+        self.policy_selected_write_admission_only = bool(policy_selected_write_admission_only)
         hooks = transaction_hooks or PaperATCCHooks(self)
         self.interceptor = OperationInterceptor(hooks, state_collector=self.state_collector)
         self._live_transactions: Dict[str, AgentTransaction] = {}
@@ -458,20 +604,29 @@ class AgentTransactionManager:
         self._paper_aborts = 0
         self._paper_background_aborts = 0
         self._runtime_started_at = time.monotonic()
+        self.runtime_metrics_window_seconds = 1.0
         self._recent_outcomes = collections.deque()
         self._recent_agent_tasks = collections.deque()
         self._paper_metrics_cache_at = 0.0
         self._paper_metrics_cache: Dict[str, float | int] = {}
         self._retry_protection: Dict[str, _RetryProtectionState] = {}
+        self.policy_controlled_retry_protection = False
         self._retry_protection_diagnostics: Dict[str, int] = collections.defaultdict(int)
         self._retry_conflict_objects: Dict[str, int] = collections.defaultdict(int)
         self._paper_versioning_enabled = False
         self._native_dirty_objects: set[str] = set()
         self._native_occ_stable_windows = 0
         self._native_occ_fast_enabled = False
+        self._native_occ_fast_starts = 0
         self._native_occ_last_window_at = 0.0
         self._hotspot_admission_guard = threading.Lock()
         self._hotspot_admissions: Dict[str, threading.Lock] = {}
+        self._cycle_safe_gate_diagnostics = {"admissions": 0, "bypasses": 0}
+        self._coordinated_admission = None
+        if self.coordinated_hotspot_admission:
+            from .hotspot_admission import CoordinatedHotspotAdmission
+            self._coordinated_admission = CoordinatedHotspotAdmission(
+                record_externalities=self.helper_externality_accounting and self.collect_trajectories)
         self._background_sampling = threading.local()
         self._hotness_sampling = threading.local()
         self._native_background_plan_cache: Dict[
@@ -498,6 +653,15 @@ class AgentTransactionManager:
             return bool(
                 self.low_conflict_occ_guard and self._native_occ_fast_enabled
             )
+
+    def note_native_occ_fast_start(self) -> None:
+        with self._lock:
+            self._native_occ_fast_starts += 1
+
+    @property
+    def native_occ_fast_starts(self) -> int:
+        with self._lock:
+            return self._native_occ_fast_starts
 
     def observe_native_occ_window(self, *, risk: bool) -> bool:
         """Global two-window hysteresis for the native action-0 path."""
@@ -526,27 +690,117 @@ class AgentTransactionManager:
     ) -> bool:
         """Reserve already-observed hotspots in canonical order."""
         targets = tuple(sorted({str(value) for value in object_ids}))
+        if self.coordinated_hotspot_admission:
+            accounted = [False]
+            def refresh_paid_work():
+                self._refresh_hotspot_admission_priority(txn)
+                accounted[0] = True
+            try:
+                return self._coordinated_admission.acquire(txn.context, targets,
+                    timeout_s=timeout_s, native_dependencies=self.atcc_locks.wait_dependencies_snapshot,
+                    priority_refresh=refresh_paid_work)
+            finally:
+                if accounted[0]:
+                    # The helper has separately measured blocking. The next
+                    # SQL must not charge this CC interval as Agent reasoning.
+                    self.interceptor.reset_agent_interval(txn)
+        if self.unified_commit_admission:
+            if not targets:
+                return False
+            # Never nest a private admission gate with ATCC locks: a retry may
+            # already hold an exact read lock that the gate holder needs to
+            # upgrade. Admit the same revealed suffix using one lock order and
+            # the existing priority/Wound-Wait scheduler for every policy.
+            self.refresh_atcc_priority(txn)
+            self.atcc_locks.acquire_write_set(targets, txn.context, timeout_s=timeout_s)
+            observed = set(targets) & set(txn.read_set)
+            stale = self._conflict_targets((key, int(txn.read_set[key].version)) for key in observed)
+            if stale:
+                raise LockConflict("retroactive admission validation failed", stale, kind="version-conflict")
+            txn.metadata.setdefault("_unified_hotspot_targets", set()).update(targets)
+            return True
         held = list(txn.metadata.get("_observed_hotspot_admissions", ()))
         held_targets = {str(target) for target, _gate in held}
         targets = tuple(target for target in targets if target not in held_targets)
+        nonblocking = False
+        if self.cycle_safe_hotspot_admission:
+            # Private gates are a performance helper, not correctness locks.
+            # Never allow an unbounded wait under an ATCC lock: the gate owner
+            # may itself be waiting for that lock (even on another object).
+            # Existing commit WriteSet admission and version validation remain
+            # mandatory; unlike unified admission, do not acquire extra early
+            # WLocks or introduce an additional retroactive validation point.
+            locked = txn.context.held_read_locks or txn.context.held_write_locks
+            backwards = bool(held_targets and targets and min(targets) < max(held_targets))
+            if backwards or not targets:
+                txn.metadata.setdefault("_cycle_safe_gate_bypass_targets", set()).update(targets)
+                if backwards:
+                    with self._hotspot_admission_guard:
+                        self._cycle_safe_gate_diagnostics["bypasses"] += 1
+                return True
+            # Preserve useful admission on uncontended gates. Only the wait
+            # creates a nested cycle; the default immediate try is safe under
+            # existing ATCC locks. An explicit bounded wait budget allows a
+            # benign short suffix to finish but expires a real cycle. Roll
+            # back this call's partial gates on expiry; normal commit admission
+            # and validation still arbitrate publication.
+            nonblocking = bool(locked)
         if not targets:
             return False
         acquired: list[tuple[str, threading.Lock]] = []
         deadline = time.monotonic() + max(0.0, float(timeout_s))
+        if nonblocking:
+            # One total bounded budget for this helper call, not per key.
+            # Expiry rolls back partial gates and breaks any nested wait cycle.
+            deadline = min(deadline,time.monotonic()+self.cycle_safe_gate_wait_ms/1000.)
         for target in targets:
             with self._hotspot_admission_guard:
                 gate = self._hotspot_admissions.setdefault(target, threading.Lock())
             remaining = max(0.0, deadline - time.monotonic())
-            if not gate.acquire(timeout=remaining):
+            obtained = (gate.acquire(blocking=False) if self.cycle_safe_gate_wait_ms <= 0
+                        else gate.acquire(timeout=remaining)) if nonblocking else gate.acquire(timeout=remaining)
+            if not obtained:
                 for _key, held in reversed(acquired):
                     held.release()
+                if nonblocking:
+                    txn.metadata.setdefault("_cycle_safe_gate_bypass_targets", set()).update(targets)
+                    with self._hotspot_admission_guard:
+                        self._cycle_safe_gate_diagnostics["bypasses"] += 1
+                    return True
                 return False
             acquired.append((target, gate))
         txn.metadata["_observed_hotspot_admissions"] = held + acquired
+        if self.cycle_safe_hotspot_admission:
+            with self._hotspot_admission_guard:
+                self._cycle_safe_gate_diagnostics["admissions"] += 1
         return True
+
+    def cycle_safe_gate_diagnostics(self) -> Dict[str, int]:
+        """Whole helper reservations/bypasses, not locks or logical commits."""
+        with self._hotspot_admission_guard:
+            return dict(self._cycle_safe_gate_diagnostics)
+
+    def coordinated_gate_diagnostics(self) -> Dict[str, float]:
+        if self._coordinated_admission is None:
+            return {}
+        return self._coordinated_admission.snapshot()["diagnostics"]
+
+    def _refresh_hotspot_admission_priority(self, txn: AgentTransaction) -> None:
+        # Called only on the contended coordinated-helper branch, outside its
+        # condition. SQL hooks last accounted the interval at the previous SQL;
+        # the caller may have since completed Agent reasoning/external work.
+        # Account that observed elapsed interval BEFORE ranking queued paid
+        # work. Do not change the formula, anticipate future work or charge
+        # the forthcoming helper wait here. The uncontended fast path and the
+        # default legacy helper never call this callback.
+        self.interceptor.account_agent_interval(txn)
+        self.refresh_atcc_priority(txn)
 
     @staticmethod
     def release_hotspot_admission(txn: AgentTransaction) -> None:
+        coordinator = txn.manager._coordinated_admission
+        if coordinator is not None:
+            coordinator.release_all(txn.context)
         acquired = list(txn.metadata.pop("_observed_hotspot_admissions", ()))
         for _target, gate in reversed(acquired):
             gate.release()
@@ -574,11 +828,20 @@ class AgentTransactionManager:
         table once every eight operations, avoiding metadata work on every
         native OCC operation.
         """
+        if self.exact_hotness_accounting:
+            # Actual issued operations are counted once by the interceptor.
+            # Repeated policy/hook queries must not create artificial accesses.
+            return self.hotness_tracker.is_hot(str(object_id))
         count = int(getattr(self._hotness_sampling, "count", 0) or 0) + 1
         self._hotness_sampling.count = count
         key = str(object_id)
         if count <= 2 or count % 8 == 0:
             return self.hotness_tracker.observe_access(key)
+        if self.consistent_hotness_classification:
+            # Sampling controls metadata updates, not the observed object's
+            # lock class. An unsampled access must not demote a known hotspot
+            # to cold while refresh_hot_targets() still classifies it as hot.
+            return self.hotness_tracker.is_hot(key)
         return False
 
     def peek_hot(self, object_id: str, *, total_accesses: int | None = None) -> bool:
@@ -588,10 +851,19 @@ class AgentTransactionManager:
     def refresh_hot_targets(self, txn: AgentTransaction) -> None:
         read_targets = set(txn.read_set) | set(txn.context.read_versions)
         write_targets = set(txn.write_set) | set(txn.context.write_targets)
-        txn.context.hot_read_targets = self.hotness_tracker.hot_targets(read_targets)
-        txn.context.hot_write_targets = self.hotness_tracker.hot_targets(write_targets)
+        if self.consistent_hotness_classification:
+            # A key in both footprints must not straddle two expiry/ranking
+            # instants. Observe the union once, then project the SAME snapshot.
+            hot = self.hotness_tracker.hot_targets(read_targets | write_targets)
+            txn.context.hot_read_targets = read_targets & hot
+            txn.context.hot_write_targets = write_targets & hot
+        else:
+            # Preserve legacy experiments' separate observation points.
+            txn.context.hot_read_targets = self.hotness_tracker.hot_targets(read_targets)
+            txn.context.hot_write_targets = self.hotness_tracker.hot_targets(write_targets)
 
-    def transition_atcc_action(self, txn: AgentTransaction, action: Any, *, timeout_s: float = 5.0) -> None:
+    def transition_atcc_action(self, txn: AgentTransaction, action: Any, *, timeout_s: float = 5.0,
+                               reconcile_reads: bool = False,allow_mask_reduction: bool = False) -> None:
         """Retroactively validate and lock objects newly protected by an action."""
         if not self.paper_versioning_enabled:
             self._enable_paper_versioning()
@@ -602,8 +874,16 @@ class AgentTransactionManager:
         if not online_observed:
             self.ensure_snapshot_epoch(txn)
         previous = txn.context.action
-        added = action.added_since(previous)
+        added = (action.protected & ~previous.protected if allow_mask_reduction
+                 else action.added_since(previous))
         self.refresh_hot_targets(txn)
+        if (reconcile_reads and action.protected==previous.protected
+                and not (action.protected & (LockClass.HOT_READ | LockClass.COLD_READ))):
+            # No selected read class can become eligible. Preserve the normal
+            # versioning/snapshot/hotness side effects above, but avoid scanning
+            # both footprints for a reconciliation that cannot acquire a lock.
+            # Existing held locks (including revisable-mask leftovers) remain.
+            return
         defer_write_locks = bool(
             txn.metadata.get("_defer_policy_write_locks", False)
         )
@@ -614,6 +894,13 @@ class AgentTransactionManager:
         )
         read_targets = []
         write_targets: dict[str, int] = {}
+        # Explicit engineering variant: category changes affect subsequently
+        # issued reads, while old observations still undergo final validation.
+        # Do not use this switch for declared/offline footprints, or release
+        # locks already held by the attempt. Legacy category backfill remains
+        # the default.
+        prospective_reads = bool(online_observed and getattr(
+            self, 'prospective_category_read_protection', False))
         for object_id, read in txn.read_set.items():
             hot = object_id in txn.context.hot_read_targets
             planned_write = object_id in txn.context.planned_write_targets
@@ -626,7 +913,12 @@ class AgentTransactionManager:
                     txn.context.policy_write_lock_targets.add(str(object_id))
                 else:
                     write_targets[object_id] = int(read.version)
-            elif action.protects(hot=hot, write=False) and not previous.protects(hot=hot, write=False):
+            elif (not prospective_reads
+                  and action.protects(hot=hot, write=False)
+                  and (not previous.protects(hot=hot, write=False) or reconcile_reads)
+                  and object_id not in txn.context.held_read_locks
+                  and object_id not in txn.context.held_write_locks
+                  and self.category_read_lock_needed(txn, object_id)):
                 read_targets.append((object_id, int(read.version)))
         for object_id, write in txn.write_set.items():
             hot = object_id in txn.context.hot_write_targets
@@ -635,11 +927,17 @@ class AgentTransactionManager:
                     txn.context.policy_write_lock_targets.add(str(object_id))
                 else:
                     write_targets[object_id] = int(write.base_version)
-        if online_observed and len(read_targets) > 1:
+        if (online_observed and len(read_targets) > 1
+                and not getattr(self, "complete_category_read_protection", False)):
             # One exact observed root is sufficient to desynchronize the long
             # reasoning window. Holding several RLocks and later upgrading a
             # subset creates a multi-key upgrade convoy.
-            read_targets = [
+            checkpoint_target = txn.metadata.get("_commit_read_checkpoint_target") if self.commit_read_checkpoints else None
+            checkpoint_reads = [row for row in read_targets if row[0] == checkpoint_target]
+            # A post-read decision should protect the just-observed dependency,
+            # not an unrelated older hot root. It must already be a matching
+            # read_set entry; preserve the one-root bound and legacy fallback.
+            read_targets = checkpoint_reads or [
                 max(
                     read_targets,
                     key=lambda row: int(
@@ -685,8 +983,16 @@ class AgentTransactionManager:
                     timeout_s=timeout_s,
                 )
                 txn.context.policy_write_lock_targets.add(str(object_id))
-            self.interceptor.action_change(txn, action)
-            txn._event("action-change", {"added": int(added), "action": int(action.protected)})
+            if action.protected != previous.protected or not reconcile_reads:
+                self.interceptor.action_change(txn, action,allow_mask_reduction=allow_mask_reduction)
+                detail={"added": int(added), "action": int(action.protected)}
+                if not action.expands(previous):
+                    detail['removed_future_classes']=int(previous.protected & ~action.protected)
+                    detail['held_locks_released']=False
+                txn._event("action-change", detail)
+            elif read_targets:
+                txn._event("selected-read-reconciliation", {"targets": len(read_targets),
+                           "action": int(action.protected)})
         except LockConflict as exc:
             self.atcc_locks.release_all(txn.context)
             txn.abort(
@@ -695,6 +1001,17 @@ class AgentTransactionManager:
                 conflict_object_ids=exc.targets,
             )
             raise
+
+    def reconcile_selected_read_protection(self, txn: AgentTransaction, *, timeout_s: float = 5.0) -> None:
+        """Materialize selected read protection for newly eligible observations.
+
+        Used only by the opt-in checkpoint hook. This does not change the
+        category action, predict future accesses, release locks or skip version
+        validation. Existing one-root/category-elision settings still apply.
+        """
+        txn._ensure_active()
+        self.transition_atcc_action(txn, txn.context.action, timeout_s=timeout_s,
+                                    reconcile_reads=True)
 
     def refresh_atcc_priority(self, txn: AgentTransaction) -> int:
         if not self.priority_enabled:
@@ -710,9 +1027,10 @@ class AgentTransactionManager:
                 cached["waiter_count"] = self.atcc_locks.global_waiter_count()
                 cached["background_aborts"] = self._paper_background_aborts
                 return cached
-            while self._recent_outcomes and now - self._recent_outcomes[0][0] > 1.0:
+            window = self.runtime_metrics_window_seconds
+            while self._recent_outcomes and now - self._recent_outcomes[0][0] > window:
                 self._recent_outcomes.popleft()
-            while self._recent_agent_tasks and now - self._recent_agent_tasks[0][0] > 1.0:
+            while self._recent_agent_tasks and now - self._recent_agent_tasks[0][0] > window:
                 self._recent_agent_tasks.popleft()
             outcomes = tuple(self._recent_outcomes)
             agent_tasks = tuple(self._recent_agent_tasks)
@@ -723,7 +1041,7 @@ class AgentTransactionManager:
         background_attempts = [row for row in outcomes if row[3]]
         committed_background = [row for row in background_attempts if row[1]]
         committed_agent_tasks = [row for row in agent_tasks if row[1]]
-        elapsed = max(0.1, min(1.0, now - self._runtime_started_at))
+        elapsed = max(0.1, min(window, now - self._runtime_started_at))
         latencies = sorted(row[2] for row in commits)
         tail_index = max(0, min(len(latencies) - 1, int(0.99 * len(latencies))))
         agent_task_latencies = sorted(row[2] for row in committed_agent_tasks)
@@ -779,21 +1097,42 @@ class AgentTransactionManager:
             self._paper_metrics_cache = dict(metrics)
         return metrics
 
-    def _note_runtime_outcome(self, txn: AgentTransaction, committed: bool) -> None:
+    def _note_runtime_outcome(self, txn: AgentTransaction, committed: bool) -> bool:
+        """Claim attempt accounting once; do not skip late-owner cleanup/feedback.
+
+        Opt-in keeps legacy accounting reproducible. The claim lives on the
+        attempt object (not the logical task/tid) and uses the existing manager
+        lock, never a foreign lifecycle lock from the wound callback.
+        Unsampled background attempts still claim their abort counter once.
+        """
         sample_rate = int(txn.metadata.get("_background_metric_sample_rate", 1) or 1)
-        if sample_rate > 1 and not txn.metadata.get("_background_metric_sampled", False):
-            return
+        sampled = sample_rate <= 1 or txn.metadata.get("_background_metric_sampled", False)
+        if not self.unique_attempt_outcomes and not sampled:
+            return True  # Legacy: no metric row, but caller still counts abort.
         with self._lock:
-            self._recent_outcomes.append(
-                (
-                    time.monotonic(),
-                    bool(committed),
-                    (time.perf_counter() - txn.started_at) * 1000.0,
-                    bool(txn.context.is_background),
-                    normalize_conflict_kind(txn.context.recent_conflict_kind) if not committed else "none",
-                    sample_rate,
+            if self.unique_attempt_outcomes:
+                if getattr(txn, "_runtime_outcome_recorded", False):
+                    self._runtime_duplicate_outcomes += 1
+                    return False
+                txn._runtime_outcome_recorded = True
+                self._runtime_outcomes_recorded += 1
+            if sampled:
+                self._recent_outcomes.append(
+                    (
+                        time.monotonic(),
+                        bool(committed),
+                        (time.perf_counter() - txn.started_at) * 1000.0,
+                        bool(txn.context.is_background),
+                        normalize_conflict_kind(txn.context.recent_conflict_kind) if not committed else "none",
+                        sample_rate,
+                    )
                 )
-            )
+        return True
+
+    def runtime_outcome_diagnostics(self) -> Dict[str, int]:
+        with self._lock:
+            return {"recorded": self._runtime_outcomes_recorded,
+                    "duplicates_suppressed": self._runtime_duplicate_outcomes}
 
     def _commit_timing_bucket(self, txn: AgentTransaction) -> dict[str, float] | None:
         if not txn.metadata.get("_commit_timing_sampled", False):
@@ -1077,10 +1416,72 @@ class AgentTransactionManager:
         reads = frozenset(str(value) for value in read_targets)
         writes = frozenset(str(value) for value in write_targets)
         with self._lock:
+            if self.observed_write_read_lock_elision:
+                self._observed_committed_write_objects.update(writes)
             self._commit_dependency_sequence += 1
             self._commit_dependency_history.append(
                 (self._commit_dependency_sequence, reads, writes)
             )
+
+    def _costly_observed_write_suffix(self, txn: AgentTransaction) -> bool:
+        """Default-off conservative fallback after paid work and actual writes."""
+        return bool(getattr(self, 'cost_aware_read_elision', False)
+            and txn.context.phase == TransactionPhase.COMMIT
+            and txn.context.write_targets
+            and txn.context.agent_cost_ms >= self.priority_manager.config.interval_quantum_ms)
+
+    def reconcile_costly_read_protection(self, txn: AgentTransaction) -> None:
+        """Install selected protection when an observed read stops being elidable.
+
+        Eligibility can change without adding an action bit (e.g. HotAlways
+        selected cold-read protection before any writes were observed). Keep
+        that control fully effective too. Never protect an unobserved key or
+        override the policy action; normal version validation remains required.
+        """
+        if not self._costly_observed_write_suffix(txn):
+            return
+        # A late lock can only be useful for an already-observed read that has
+        # become an actual write dependency in this attempt.  Protecting the
+        # whole read set here would turn private refinement reads into a commit
+        # convoy under long reasoning.  ``write_set`` is populated only after
+        # the write operation has been issued, so this uses no future plan.
+        for key, read in sorted(txn.read_set.items()):
+            if key not in txn.write_set:
+                continue
+            if key in txn.context.held_read_locks or key in txn.context.held_write_locks:
+                continue
+            hot = key in txn.context.hot_read_targets
+            if not txn.context.action.protects(hot=hot, write=False):
+                continue
+            self.atcc_locks.validate_and_rlock(key, txn.context, int(read.version),
+                lambda object_id=key: int(self.version_manager.read_committed(object_id).version))
+            txn.context.policy_read_lock_targets.add(key)
+
+    def category_read_lock_needed(self, txn: AgentTransaction, object_id: str) -> bool:
+        """Default-off category elision from past writes/contention, not immutability.
+
+        This does not authorize validation bypass or release an existing lock.
+        Exact retry/version-risk protections are handled separately by hooks.
+        A previously unseen writer can still invalidate an unprotected read;
+        ordinary commit validation and retries remain mandatory.
+        """
+        if not self.observed_write_read_lock_elision:
+            return True
+        if self._costly_observed_write_suffix(txn):
+            return True
+        key = str(object_id)
+        if (key in txn.context.retry_conflict_read_targets
+                or key in txn.context.retry_conflict_write_targets
+                or key in txn.metadata.get("_version_risk_read_targets", ())):
+            return True
+        if key in txn.write_set:
+            return True
+        with self._lock:
+            if key in self._observed_committed_write_objects:
+                return True
+        heat = self.hotness_tracker.object_snapshot(key)
+        return any(float(heat.get(field, 0) or 0) > 0 for field in
+                   ("conflicts", "validation_failures", "lock_wait_events", "wounds"))
 
     def _safe_online_serialization_before_targets(
         self,
@@ -1159,14 +1560,71 @@ class AgentTransactionManager:
     def backend_name(self) -> str:
         return str(self.store.backend_name)
 
-    def register_object(self, object_id: str, initial_value: Any, *, kind: str = "generic") -> None:
+    def register_object(self, object_id: str, initial_value: Any, *, kind: str = "generic",
+                        storage_id: str = "default") -> None:
         if kind not in self._KIND_MAP:
             raise ValueError(f"unsupported object kind: {kind}")
         key = str(object_id)
         with self._lock:
             if key in self._catalog:
                 raise ValueError(f"object already registered: {key}")
-            self.store.put(key, str(initial_value))
+            if hasattr(self.store, "register_route"):
+                self.store.register_route(key, storage_id)
+            elif storage_id != "default":
+                raise ValueError("non-default storage_id requires storage_engines")
+            try:
+                self.store.put(key, str(initial_value))
+            except BaseException:
+                if hasattr(self.store, "unregister_route"):
+                    self.store.unregister_route(key)
+                raise
+            self._catalog[key] = self._KIND_MAP[kind]
+            self.version_manager.register_object(key)
+
+    def attach_existing_object(self, object_id: str, *, kind: str = "generic",
+                               storage_id: str = "default") -> None:
+        """Rebuild a fresh manager catalog after a durable store has recovered.
+
+        Never rewrites the persisted value/version. Use before admitting tasks.
+        """
+        if kind not in self._KIND_MAP:
+            raise ValueError(f"unsupported object kind: {kind}")
+        key = str(object_id)
+        with self._lock:
+            if self._live_transactions:
+                raise RuntimeError("attach existing objects before admitting transactions")
+            if key in self._catalog:
+                raise ValueError(f"object already registered: {key}")
+            if hasattr(self.store, "storage_id_for"):
+                if self.store.storage_id_for(key) != storage_id:
+                    raise ValueError("persisted storage route differs")
+            elif storage_id != "default":
+                raise ValueError("non-default storage_id requires a routed store")
+            if not self.store.get(key).exists:
+                raise ValueError(f"persisted object missing: {key}")
+            self._catalog[key] = self._KIND_MAP[kind]
+            self.version_manager.register_object(key)
+
+    def register_empty_object(self, object_id: str, *, kind: str = "row",
+                              storage_id: str = "default") -> None:
+        """Register an insert target without publishing a placeholder value."""
+        if kind not in self._KIND_MAP:
+            raise ValueError(f"unsupported object kind: {kind}")
+        key = str(object_id)
+        with self._lock:
+            if key in self._catalog:
+                return
+            if hasattr(self.store, "register_route"):
+                self.store.register_route(key, storage_id)
+            elif storage_id != "default":
+                raise ValueError("non-default storage_id requires storage_engines")
+            try:
+                if self.store.get(key).exists:
+                    raise ValueError(f"unregistered object already exists: {key}")
+            except BaseException:
+                if hasattr(self.store, "unregister_route"):
+                    self.store.unregister_route(key)
+                raise
             self._catalog[key] = self._KIND_MAP[kind]
             self.version_manager.register_object(key)
 
@@ -1224,7 +1682,6 @@ class AgentTransactionManager:
                     self._retry_protection.pop(task_key, None)
                 inherited = self._retry_protection.get(task_key)
                 if inherited is not None:
-                    explicit_mask |= inherited.mask
                     metadata["retry_validation_conflicts"] = int(
                         inherited.validation_conflicts
                     )
@@ -1232,13 +1689,17 @@ class AgentTransactionManager:
                     for detail in inherited.last_conflicts:
                         retry_conflict_mask |= LockClass(int(detail.protection_bit))
                     metadata["retry_conflict_mask"] = int(retry_conflict_mask)
-                    metadata["retry_conflict_read_targets"] = sorted(
-                        inherited.protected_read_targets
-                    )
-                    metadata["retry_conflict_write_targets"] = sorted(
-                        inherited.protected_write_targets
-                    )
-                    self._retry_protection_diagnostics["inherited_attempts"] += 1
+                    if self.policy_controlled_retry_protection:
+                        self._retry_protection_diagnostics["policy_controlled_retry_observations"] += 1
+                    else:
+                        explicit_mask |= inherited.mask
+                        metadata["retry_conflict_read_targets"] = sorted(
+                            inherited.protected_read_targets
+                        )
+                        metadata["retry_conflict_write_targets"] = sorted(
+                            inherited.protected_write_targets
+                        )
+                        self._retry_protection_diagnostics["inherited_attempts"] += 1
             metadata["retry_protection_mask"] = int(explicit_mask)
         if metadata.get("paper_atcc_backend", False):
             # Coordinated background publication uses private versions even
@@ -1565,6 +2026,11 @@ class AgentTransactionManager:
         ):
             return
         txn.state = TransactionState.ABORTED
+        # Forced wound does not pass through AgentTransaction.abort(). Release
+        # helper reservations here as well, before hooks or recording can fail.
+        # The coordinator never enters the native lock table while holding its
+        # condition, so this is safe from the native wound callback.
+        self.release_hotspot_admission(txn)
         context.note_conflict("lock-preempted")
         txn._event("wound", {"reason": str(reason)})
         txn.result = txn._result(
@@ -1573,9 +2039,9 @@ class AgentTransactionManager:
             action="abort",
             reason=str(reason),
         )
-        self._note_runtime_outcome(txn, False)
-        with self._lock:
-            self._paper_aborts += 1
+        if self._note_runtime_outcome(txn, False):
+            with self._lock:
+                self._paper_aborts += 1
         self._record(txn)
         self.interceptor.abort(txn, str(reason))
         self.interceptor.finish(txn)
@@ -1957,6 +2423,21 @@ class AgentTransactionManager:
                 txn, online_bypass_read_targets
             )
         )
+        certified_read_only = False
+        if (paper_atcc and not txn.write_set and not txn.context.is_background
+                and getattr(self,'read_only_snapshot_certification_enabled',False)
+                and '_read_certificate_begin_epoch' in txn.metadata):
+            epoch=self.version_manager.certify_common_read_epoch(
+                {key:int(read.version) for key,read in txn.read_set.items()},
+                not_before_epoch=txn.metadata['_read_certificate_begin_epoch'])
+            certified_read_only=epoch is not None
+            self.read_only_snapshot_certificate_metrics['accepted' if certified_read_only else 'rejected']+=1
+            if certified_read_only:
+                txn.metadata['_certified_read_only_epoch']=epoch
+                self.read_only_snapshot_certificates.append(dict(tid=txn.context.tid,epoch=epoch,
+                    begin_epoch=txn.metadata['_read_certificate_begin_epoch'],
+                    read_versions={key:int(read.version) for key,read in txn.read_set.items()}))
+                online_serialization_before_targets.update(txn.read_set)
         if pinned_read_targets and txn.context.snapshot_epoch >= 0:
             pinned_read_targets = set(txn.read_set) - set(txn.write_set)
         if paper_atcc and not txn.context.is_background and pinned_read_targets:
@@ -2041,6 +2522,7 @@ class AgentTransactionManager:
             if (
                 paper_atcc
                 and not txn.context.is_background
+                and not certified_read_only
                 and not protected
                 and (
                     read.object_id in foreign_committing_writers
@@ -2349,9 +2831,9 @@ class AgentTransactionManager:
             retry_protection_mask=retry_mask,
             lock_wait_s=lock_wait_s,
         )
-        self._note_runtime_outcome(txn, False)
-        with self._lock:
-            self._paper_aborts += 1
+        if self._note_runtime_outcome(txn, False):
+            with self._lock:
+                self._paper_aborts += 1
         self._record(txn)
         self.interceptor.finish(txn)
         self.atcc_locks.release_all(txn.context)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import dataclasses
 import random
 import threading
@@ -732,7 +733,19 @@ def run_agent_attempt(
     transaction_id: str | None = None,
 ) -> tuple[Dict[str, Any], str, float, Dict[str, Any]]:
     sleep_for_reasoning(jitter_ms)
-    sleep_for_reasoning(planned.retry_delay_ms)
+    retry_started_ns = time.perf_counter_ns()
+    profile = getattr(manager, "trace_profile", None)
+    retry_scope = (profile.clock.scope("retry_reconsideration")
+                   if profile is not None else contextlib.nullcontext())
+    with retry_scope:
+        sleep_for_reasoning(planned.retry_delay_ms)
+    observed_retry_reasoning_ms = (
+        (time.perf_counter_ns() - retry_started_ns) / 1e6
+        if planned.retry_delay_ms > 0 and (
+            getattr(manager, "paper_observed_contract", None)
+            or getattr(manager, "account_prebegin_retry_cost", False))
+        else 0.0
+    )
     strategy_impl = manager.cc_registry.resolve(strategy)
     decision = None
     ycsb_warmed_low_write_replay = should_use_ycsb_warmed_low_write_replay(
@@ -773,6 +786,7 @@ def run_agent_attempt(
             background_workers=background_workers,
             strategy=strategy,
             decision=None,
+            observed_retry_reasoning_ms=observed_retry_reasoning_ms,
         )
         metadata.update(
             {
@@ -914,6 +928,7 @@ def run_agent_attempt(
             background_workers=background_workers,
             strategy=strategy,
             decision=None,
+            observed_retry_reasoning_ms=observed_retry_reasoning_ms,
         )
         # The eligible first attempt runs on the native optimistic engine, but
         # a failed attempt still belongs to the paper runtime's logical transaction.
@@ -955,6 +970,7 @@ def run_agent_attempt(
             background_workers=background_workers,
             strategy=strategy,
             decision=None,
+            observed_retry_reasoning_ms=observed_retry_reasoning_ms,
         )
         metadata["paper_atcc"] = True
         if transaction_id is not None:
@@ -1030,6 +1046,7 @@ def run_agent_attempt(
             background_workers=background_workers,
             strategy=strategy,
             decision=None,
+            observed_retry_reasoning_ms=observed_retry_reasoning_ms,
         )
         result, action, wait_s = run_agent_with_low_conflict_optimistic_fast_path(
             manager,
@@ -1058,6 +1075,7 @@ def run_agent_attempt(
             background_workers=background_workers,
             strategy=strategy,
             decision=None,
+            observed_retry_reasoning_ms=observed_retry_reasoning_ms,
         )
         result, action, wait_s = run_agent_with_write_validate_fast_path(
             manager,
@@ -1123,7 +1141,12 @@ def run_agent_attempt(
         background_workers=background_workers,
         strategy=strategy,
         decision=decision,
+        observed_retry_reasoning_ms=observed_retry_reasoning_ms,
     )
+    if transaction_id is not None:
+        # The fixed trace row can be executed in several logical generations.
+        # Keep each generation distinct, while retries share its identity.
+        metadata['transaction_id'] = str(transaction_id)
     traditional_plan = mixed_traditional_begin_lock_plan(strategy_impl, planned.task)
     if traditional_plan is not None:
         if can_defer_transaction_begin(planned):
@@ -1295,9 +1318,20 @@ def run_agent_attempt(
     else:
         wait_s = 0.0
         txn = begin_planned_transaction(manager, planned, metadata)
-        for phase in planned.phases:
-            execute_phase(txn, phase)
-        result = txn.commit(atcc_concrete_commit_strategy(strategy_impl, action, strategy))
+        try:
+            for phase in planned.phases:
+                execute_phase(txn, phase)
+            result = txn.commit(atcc_concrete_commit_strategy(strategy_impl, action, strategy))
+        except LockConflict as exc:
+            # Ordinary CCs can reject an issued operation (e.g. Hekaton's
+            # first-writer claim), not just validation at commit. The caller's
+            # admission-error branch cannot finish an already-begun attempt.
+            # Abort here so private writes/claims/hooks and outcome accounting
+            # are completed before the retry. Do not turn application errors
+            # into contention or continue executing the failed phase.
+            result = txn.abort_or_observe_wound(
+                str(exc), strategy=strategy, conflict_object_ids=exc.targets)
+            return attempt_result(result, planned, txn), action, wait_s, attempt_diagnostics
     return {
         "committed": bool(result.committed),
         "wasted_reasoning_ms": 0 if result.committed else planned.total_reasoning_delay_ms,
@@ -2145,6 +2179,7 @@ def mixed_transaction_metadata(
     background_workers: int,
     strategy: str,
     decision: Any = None,
+    observed_retry_reasoning_ms: float = 0.0,
 ) -> Dict[str, Any]:
     access_set_visibility = paper_access_set_visibility(strategy)
     metadata: Dict[str, Any] = {
@@ -2153,6 +2188,7 @@ def mixed_transaction_metadata(
         "strategy": str(strategy),
         "context": dict(planned.task.context),
         "retry_count": int(retry_count),
+        "observed_prebegin_reasoning_ms": float(observed_retry_reasoning_ms),
         "planned_write_targets": [],
         "access_set_visibility": access_set_visibility,
         "commit_admission_write_protection": str(strategy) == "paper-atcc",
@@ -2315,12 +2351,24 @@ def begin_planned_transaction(
     planned: PlannedTask,
     metadata: Dict[str, Any],
 ) -> Any:
-    return manager.begin(
+    txn = manager.begin(
         str(metadata.get("transaction_id", "") or planned.task.task_id),
         metadata,
         snapshot_object_ids=None,
         strategy=str(metadata.get("strategy", "") or metadata.get("cc", "") or "occ"),
     )
+    # Reconsideration was already paid before begin. Keep the original begin /
+    # snapshot timing, and never substitute the planned duration for elapsed work.
+    paid_ms = float(metadata.get("observed_prebegin_reasoning_ms", 0.0))
+    if (getattr(manager, "paper_observed_contract", None)
+            or getattr(manager, "account_prebegin_retry_cost", False)) and paid_ms > 0:
+        try:
+            manager.interceptor.account_prebegin_agent_round(txn, paid_ms)
+        except BaseException:
+            if txn.result is None:
+                txn.abort("prebegin reasoning checkpoint failed")
+            raise
+    return txn
 
 
 def mixed_traditional_begin_lock_plan(strategy_impl: Any, task: AgentTask) -> CCPlan | None:
@@ -2780,15 +2828,93 @@ def semaphore_context(semaphore: threading.BoundedSemaphore):
 def execute_phase(txn: Any, phase: Any) -> None:
     txn.prepare_phase(phase.operations)
     txn.enter_phase(str(phase.name))
-    sleep_for_reasoning(phase.reasoning_delay_ms)
+    sleep_observed_reasoning(txn, phase.reasoning_delay_ms)
     execute_phase_operations(txn, phase)
+
+
+def sleep_observed_reasoning(txn: Any, delay_ms: int) -> None:
+    """Expose elapsed (never future) paid work to opt-in priority comparisons.
+
+    Keep the legacy path identical when tracking is disabled. The existing
+    interval accountant advances its watermark, so a later checkpoint cannot
+    count this completed wait twice.
+    """
+    if int(delay_ms)>0 and getattr(txn.manager,'validate_before_reasoning_enabled',False):
+        # Optional engineering control: do not pay for the next call when an
+        # already observed input is stale. No new PE answer, future access or
+        # lock acquisition; final commit validation is still mandatory.
+        txn.metadata['_pre_reasoning_validation_calls']=int(
+            txn.metadata.get('_pre_reasoning_validation_calls',0))+1
+        txn.validate_observed_prefix()
+    profile=getattr(txn.manager,'trace_profile',None)
+    scope=profile.clock.scope('reasoning') if profile is not None else contextlib.nullcontext()
+    if int(delay_ms) <= 0 or not getattr(txn.manager, 'track_inflight_agent_cost', False):
+        with scope:sleep_for_reasoning(delay_ms)
+        return
+    from agent.workloads.frozen_credit_agent import tracked_agent_wait
+    with tracked_agent_wait(txn),scope:
+        sleep_for_reasoning(delay_ms)
+    if getattr(txn.manager,'paper_observed_contract',None):
+        txn.manager.interceptor.agent_round_finished(txn)
 
 
 def execute_phase_operations(txn: Any, phase: Any) -> None:
     delays = tuple(getattr(phase, "operation_delays_ms", ()) or ())
     for index, operation in enumerate(phase.operations):
-        sleep_for_reasoning(delays[index] if index < len(delays) else 0)
-        apply_operation(txn, operation)
+        delay_ms = delays[index] if index < len(delays) else 0
+        checkpoint_enabled = bool(
+            getattr(txn.manager, "expensive_operation_checkpoint_enabled", False)
+        )
+        fraction = float(
+            getattr(txn.manager, "expensive_operation_checkpoint_fraction", 1.0)
+        )
+        # In a real agent trace the tool/read result is observed before the
+        # associated LLM reasoning interval. The legacy path kept the delay
+        # before apply_operation, which made a phase-aware policy decide before
+        # seeing the object whose protection mattered. Keep that path for
+        # compatibility, but allow the realistic ordering for controlled
+        # experiments via CASTDAS_OPERATION_BEFORE_REASONING=1.
+        observe_before_reasoning = os.environ.get(
+            "CASTDAS_OPERATION_BEFORE_REASONING", "0"
+        ).strip() == "1"
+        checkpoint_after_reasoning = os.environ.get(
+            "CASTDAS_CHECKPOINT_AFTER_REASONING", "0"
+        ).strip() == "1"
+        if checkpoint_after_reasoning and int(delay_ms) > 0 and checkpoint_enabled:
+            # Agent traces place the policy boundary after the model has
+            # finished reasoning from the already-observed prefix and before
+            # the next tool operation is issued.  This mode makes that timing
+            # explicit: the operation itself is still unknown to the policy,
+            # while previously observed dependencies can be protected before
+            # the next read/write is applied.
+            sleep_observed_reasoning(txn, int(delay_ms))
+            txn.manager.interceptor.expensive_operation_checkpoint(txn, int(delay_ms))
+            apply_operation(txn, operation)
+            if getattr(txn.manager, "synthetic_tool_rounds", False):
+                txn.manager.interceptor.agent_round_finished(txn)
+            continue
+        if observe_before_reasoning:
+            apply_operation(txn, operation)
+            if int(delay_ms) > 0 and checkpoint_enabled:
+                # The checkpoint now sees the completed tool/read prefix and
+                # can materialize a phase-dependent protection decision before
+                # the long reasoning interval.
+                txn.manager.interceptor.expensive_operation_checkpoint(txn, int(delay_ms))
+            sleep_observed_reasoning(txn, delay_ms)
+        else:
+            if int(delay_ms) > 0 and checkpoint_enabled:
+                fraction = min(1.0, max(0.0, fraction))
+                prefix_ms = int(round(int(delay_ms) * fraction))
+                sleep_observed_reasoning(txn, prefix_ms)
+                txn.manager.interceptor.expensive_operation_checkpoint(txn, int(delay_ms))
+                sleep_observed_reasoning(txn, int(delay_ms) - prefix_ms)
+            else:
+                sleep_observed_reasoning(txn, delay_ms)
+            apply_operation(txn, operation)
+        if getattr(txn.manager, "synthetic_tool_rounds", False):
+            # Explicit synthetic trace mode: one completed point operation is
+            # one tool round. A phase transition alone is not a model/tool call.
+            txn.manager.interceptor.agent_round_finished(txn)
 
 
 def sleep_phase_reasoning(phases: Sequence[Any]) -> int:

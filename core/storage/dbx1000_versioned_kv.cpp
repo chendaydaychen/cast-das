@@ -5,6 +5,7 @@
 #include <cstring>
 #include <array>
 #include <algorithm>
+#include <functional>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_set>
@@ -281,6 +282,68 @@ bool Dbx1000VersionedKVStore::BatchPutIfVersion(
     }
     VersionedValue current = impl_->Read(row);
     impl_->Write(row, write.value, current.version + 1, true);
+  }
+  return true;
+}
+
+bool Dbx1000VersionedKVStore::BatchAcrossStores(
+    std::vector<StoreBatch> batches) {
+  std::unordered_set<Dbx1000VersionedKVStore*> seen_stores;
+  for (const auto& batch : batches) {
+    if (batch.store == nullptr || !seen_stores.insert(batch.store).second) {
+      throw std::invalid_argument("cross-store batch requires distinct nonnull stores");
+    }
+    std::unordered_set<std::string> write_keys;
+    for (const auto& write : batch.writes) {
+      batch.store->impl_->Validate(write.key, write.value);
+      if (!write_keys.insert(write.key).second) return false;
+    }
+  }
+  std::sort(batches.begin(), batches.end(),
+            [](const StoreBatch& lhs, const StoreBatch& rhs) {
+              return std::less<Dbx1000VersionedKVStore*>{}(lhs.store, rhs.store);
+            });
+  std::vector<std::unique_lock<std::mutex>> locks;
+  for (const auto& batch : batches) {
+    const auto shards = LockShards(batch.checks, batch.writes);
+    for (std::size_t shard : shards) {
+      locks.emplace_back(batch.store->impl_->shard_mutexes[shard]);
+    }
+  }
+  for (const auto& batch : batches) {
+    const auto& impl = *batch.store->impl_;
+    for (const auto& check : batch.checks) {
+      if (impl.Read(impl.Find(check.key)).version != check.expected_version) {
+        return false;
+      }
+    }
+  }
+
+  // All allocation and potentially throwing reads finish before the first
+  // version changes. Pre-created empty rows are not externally visible.
+  struct PreparedWrite {
+    row_t* row;
+    std::uint64_t next_version;
+  };
+  std::vector<std::vector<PreparedWrite>> prepared(batches.size());
+  for (std::size_t i = 0; i < batches.size(); ++i) {
+    auto& impl = *batches[i].store->impl_;
+    prepared[i].reserve(batches[i].writes.size());
+    for (const auto& write : batches[i].writes) {
+      row_t* row = impl.Find(write.key);
+      if (row == nullptr) {
+        std::lock_guard<std::mutex> create_lock(impl.create_mutex);
+        row = impl.FindOrCreate(write.key);
+      }
+      prepared[i].push_back({row, impl.Read(row).version + 1});
+    }
+  }
+  for (std::size_t i = 0; i < batches.size(); ++i) {
+    auto& impl = *batches[i].store->impl_;
+    for (std::size_t j = 0; j < batches[i].writes.size(); ++j) {
+      impl.Write(prepared[i][j].row, batches[i].writes[j].value,
+                 prepared[i][j].next_version, true);
+    }
   }
   return true;
 }

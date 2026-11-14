@@ -236,7 +236,9 @@ def patch_query_h(path: Path) -> None:
     if needle not in text:
         needle = "\tbool rerun;\n"
     if needle not in text:
-        raise SystemExit(f"cannot find base_query rerun field in {path}")
+        needle = "\tuint64_t * part_to_access;\n"
+    if needle not in text:
+        raise SystemExit(f"cannot find base_query insertion field in {path}")
     repl = (
         needle
         + "#if CASTDAS_TRACE_REPLAY\n"
@@ -279,6 +281,11 @@ static void castdas_trace_apply_to_ycsb_query(ycsb_query *query, uint64_t thd_id
 #endif
 
 '''
+        header_text = (path.parent / "ycsb_query.h").read_text()
+        if "local_req_per_query" not in header_text:
+            helper = helper.replace("    query->local_req_per_query = query->request_cnt;\n", "")
+        if "is_long" not in header_text:
+            helper = helper.replace("    query->is_long = false;\n", "")
         anchor = "double ycsb_query::denom = 0;\n\n"
         if anchor not in text:
             raise SystemExit(f"cannot find ycsb_query denom anchor in {path}")
@@ -453,9 +460,16 @@ static bool castdas_trace_apply_to_tpcc_query(tpcc_query *query, uint64_t thd_id
             "    return;\n"
             "#endif\n"
         )
-        if old not in text:
-            raise SystemExit(f"cannot find tpcc part_to_access allocation in {path}")
-        text = text.replace(old, new, 1)
+        if old in text:
+            text = text.replace(old, new, 1)
+        else:
+            pattern = re.compile(
+                r"(?P<allocation>[ \t]*part_to_access = \(uint64_t \*\)[ \t]*\n"
+                r"[ \t]*mem_allocator\.alloc\(sizeof\(uint64_t\) \* g_part_cnt, thd_id\);\n)"
+            )
+            text, count = pattern.subn(r"\g<allocation>" + new[len(old):], text, count=1)
+            if count != 1:
+                raise SystemExit(f"cannot find tpcc part_to_access allocation in {path}")
     path.write_text(text)
 
 

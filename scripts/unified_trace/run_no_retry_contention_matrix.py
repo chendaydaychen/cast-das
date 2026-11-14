@@ -13,7 +13,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 GENERATOR = ROOT / "scripts" / "unified_trace" / "generate_castdas_trace.py"
 RUNNER = ROOT / "scripts" / "unified_trace" / "run_castdas_trace_fair.py"
-SYSTEMS = "2pl-wait-die,bamboo,silo,polaris,paper-atcc"
+# All comparison controllers execute through the same fixed-trace runtime.
+# `mvcc` is the runtime's MOCC-style multi-version path; bamboo/polaris are
+# the deterministic adapter paths; paper-atcc is Aegis.
+SYSTEMS = "2pl-nowait,2pl-wait-die,mvcc,silo,tictoc,bamboo,polaris,paper-atcc"
 WORKLOAD_VARIANTS = {
     "ycsb_high": "ycsb_high_z099",
     "tpcc_high_w1": "tpcc_high_w1",
@@ -80,6 +83,10 @@ def main() -> int:
     parser.add_argument("--measure-seconds", type=float, default=1.5)
     parser.add_argument("--transactions-per-worker", type=int, default=64)
     parser.add_argument("--workloads", default=",".join(DEFAULT_WORKLOADS))
+    parser.add_argument("--clients", default=",".join(str(v) for v in CLIENTS),
+                        help="comma-separated worker counts")
+    parser.add_argument("--reasoning-profile", default="agentic")
+    parser.add_argument("--reasoning-scale", type=float, default=1.0)
     parser.add_argument(
         "--max-retries",
         type=int,
@@ -100,6 +107,9 @@ def main() -> int:
     unknown = [value for value in workload_labels if value not in WORKLOAD_VARIANTS]
     if not workload_labels or unknown:
         raise SystemExit(f"unknown or empty workloads: {','.join(unknown)}")
+    client_counts = tuple(int(v.strip()) for v in str(args.clients).split(",") if v.strip())
+    if not client_counts or any(v <= 0 for v in client_counts):
+        raise SystemExit("--clients must contain positive integers")
 
     output_dir = args.output_dir.resolve()
     traces = output_dir / "traces"
@@ -110,9 +120,9 @@ def main() -> int:
     for label in workload_labels:
         variant = WORKLOAD_VARIANTS[label]
         group_rows: list[dict[str, str]] = []
-        total = len(CLIENTS) * args.repeats
+        total = len(client_counts) * args.repeats
         completed = 0
-        for clients in CLIENTS:
+        for clients in client_counts:
             for repeat in range(args.repeats):
                 seed = 992_000 + clients + repeat
                 stem = f"{label}_c{clients}_r{repeat}_s{seed}"
@@ -138,9 +148,9 @@ def main() -> int:
                             "--transactions-per-worker",
                             str(args.transactions_per_worker),
                             "--reasoning-profile",
-                            "agentic",
+                            args.reasoning_profile,
                             "--reasoning-scale",
-                            "1.0",
+                            str(args.reasoning_scale),
                         ],
                         cwd=ROOT,
                         check=True,

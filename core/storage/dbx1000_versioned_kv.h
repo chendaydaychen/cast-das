@@ -9,6 +9,12 @@ namespace cast::storage {
 
 class Dbx1000VersionedKVStore final : public VersionedKVStore {
  public:
+  struct StoreBatch {
+    Dbx1000VersionedKVStore* store;
+    std::vector<VersionCheck> checks;
+    std::vector<WriteOp> writes;
+  };
+
   explicit Dbx1000VersionedKVStore(std::size_t max_key_bytes = 512,
                                    std::size_t max_value_bytes = 8192,
                                    std::size_t bucket_count = 4096);
@@ -28,6 +34,9 @@ class Dbx1000VersionedKVStore final : public VersionedKVStore {
       const std::vector<VersionCheck>& checks) const override;
   bool BatchPutIfVersion(const std::vector<VersionCheck>& checks,
                          const std::vector<WriteOp>& writes) override;
+  // Lock all participating stores in a stable order and publish atomically.
+  // In-memory only: durability and failure recovery are outside this API.
+  static bool BatchAcrossStores(std::vector<StoreBatch> batches);
   const char* BackendName() const override { return "dbx1000"; }
 
  private:

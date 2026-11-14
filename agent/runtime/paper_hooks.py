@@ -8,6 +8,7 @@ from typing import Any
 
 from .context import LockAction, LockClass, TransactionPhase
 from .operation_interceptor import NoopTransactionHooks
+from .object_protection_plan import ObjectProtectionPlan
 
 
 class PaperATCCHooks(NoopTransactionHooks):
@@ -65,11 +66,21 @@ class PaperATCCHooks(NoopTransactionHooks):
         txn.metadata["_cold_occ_fast_task"] = False
         txn.metadata["_native_occ_stable_windows"] = 0
         txn.metadata["_native_occ_fast_ready"] = False
+        # Optional deferred protection plan.  The plan is deliberately
+        # transaction-local and starts empty: it can only contain objects
+        # observed by this attempt, never a declared/future footprint.
+        if bool(getattr(self.manager, "deferred_object_plan_enabled", False)):
+            threshold = float(getattr(self.manager, "deferred_object_plan_min_redo_ms", 0.0) or 0.0)
+            txn.metadata["_object_protection_plan"] = ObjectProtectionPlan(threshold)
         if (
             not self.manager.collect_trajectories
             and self.manager.native_occ_fast_enabled
+            and txn.context.retry_count == 0
+            and not txn.context.retry_conflict_mask
+            and txn.context.action.protected == LockClass.NONE
         ):
             txn.metadata["_cold_occ_fast_task"] = True
+            self.manager.note_native_occ_fast_start()
             return
         # The switching ablation's Static arm is a fixed protection policy,
         # not an OCC policy that happens to consult a threshold later. Install
@@ -241,10 +252,17 @@ class PaperATCCHooks(NoopTransactionHooks):
             or (
                 txn.context.action.protects(hot=hot, write=False)
                 and not exact_retry_only
+                and self.manager.category_read_lock_needed(txn, key)
             )
         ):
             self.manager.refresh_atcc_priority(txn)
             snapshot = txn.snapshot[key]
+            fresh_first_read = bool(
+                self.manager.first_access_read_refresh
+                and self.online_observed(txn)
+                and txn.context.snapshot_epoch < 0
+                and key not in txn.read_set and key not in txn.write_set
+            )
             self.manager.atcc_locks.validate_and_rlock(
                 key,
                 txn.context,
@@ -263,6 +281,9 @@ class PaperATCCHooks(NoopTransactionHooks):
                         ).version
                     )
                 ),
+                refresh_unobserved_snapshot=(
+                    lambda: txn.refresh_unobserved_locked_snapshot(key)
+                ) if fresh_first_read else None,
             )
             txn.context.policy_read_lock_targets.add(key)
             self.mark_online_bypass_read(txn, key)
@@ -322,7 +343,9 @@ class PaperATCCHooks(NoopTransactionHooks):
             # write is actually issued it is safe to remember its exact key,
             # even when the current dynamic category action is OCC. Admission
             # then protects only this key at commit; no future access is used.
-            txn.context.policy_write_lock_targets.add(key)
+            if (not self.manager.policy_selected_write_admission_only
+                    or category_write_protected):
+                txn.context.policy_write_lock_targets.add(key)
             return
         if exact_write or category_write_protected:
             self.manager.refresh_atcc_priority(txn)
@@ -388,7 +411,8 @@ class PaperATCCHooks(NoopTransactionHooks):
             sorted(
                 object_id
                 for object_id in candidates
-                if object_id.startswith("tpcc:warehouse:")
+                if object_id in getattr(self.manager,'tpcc_root_descriptors',{})
+                or object_id.startswith("tpcc:warehouse:")
                 or object_id.startswith("tpcc:district:")
             )
         )
@@ -399,6 +423,9 @@ class PaperATCCHooks(NoopTransactionHooks):
             parts = object_id.split(":")
             object_type = parts[1] if len(parts) > 1 else ""
             field = parts[-1] if parts else ""
+            descriptor=getattr(self.manager,'tpcc_root_descriptors',{}).get(object_id)
+            if descriptor is not None:
+                object_type,field=descriptor
             exact_changes, family_changes, total_changes = (
                 self.manager.version_manager.background_change_evidence(
                     object_id,
@@ -445,6 +472,8 @@ class PaperATCCHooks(NoopTransactionHooks):
             return
         if txn.metadata.get("_cold_occ_fast_task", False):
             return
+        if getattr(self.manager, "commit_read_checkpoints", False) and phase == TransactionPhase.COMMIT:
+            txn.metadata["_commit_checkpoint_reads"] = set(txn.context.read_versions)
         initial_explore = (
             phase == TransactionPhase.EXPLORE
             and not txn.context.read_versions
@@ -460,7 +489,9 @@ class PaperATCCHooks(NoopTransactionHooks):
             # policy lookup occurs only after the initial operation batch,
             # when its observed access and cost state is available.
             return
-        if self._policy_invocation_ops(txn) > 0:
+        if self._policy_invocation_ops(txn) > 0 and not getattr(
+            self.manager, "phase_policy_on_transition", False
+        ):
             if phase == TransactionPhase.COMMIT:
                 self._protect_tpcc_read_before_write(txn, require_evidence=True)
             return
@@ -471,8 +502,43 @@ class PaperATCCHooks(NoopTransactionHooks):
             # observed high-frequency root dependency before the write suffix.
             self._protect_tpcc_read_before_write(txn, require_evidence=True)
 
+    def after_read(self, txn: Any, object_id: str, version: int) -> None:
+        self._observe_deferred_object(txn, object_id, version, write=False)
+        if (not getattr(self.manager, "commit_read_checkpoints", False)
+                or not self.enabled(txn) or txn.metadata.get("_cold_occ_fast_task", False)
+                or txn.context.phase != TransactionPhase.COMMIT):
+            return
+        # The operation has already populated read_set/read_versions. Never
+        # use commit_targets, object names or a future declared footprint.
+        seen = txn.metadata.setdefault("_commit_checkpoint_reads", set())
+        key = str(object_id)
+        if key not in seen:
+            seen.add(key)
+            txn.metadata["_commit_read_checkpoint_pending"] = key
+
+    def after_write(self, txn: Any, object_id: str) -> None:
+        if not self.enabled(txn):
+            return
+        key = str(object_id)
+        record = txn.write_set.get(key)
+        if record is not None:
+            self._observe_deferred_object(txn, key, int(record.base_version), write=True)
+
     def on_operation_finished(self, txn: Any) -> None:
         if not self.enabled(txn) or txn.metadata.get("_cold_occ_fast_task", False):
+            return
+        checkpoint_target = txn.metadata.pop("_commit_read_checkpoint_pending", None)
+        if checkpoint_target is not None:
+            # Run after SQL accounting. Keep the original phase checkpoints;
+            # new decision times are common to Full, rules and ablations.
+            txn.metadata["_last_policy_checkpoint_ops"] = int(txn.context.completed_operations)
+            self.manager.refresh_atcc_priority(txn)
+            txn.metadata["_commit_read_checkpoint_target"] = checkpoint_target
+            try:
+                self._select_and_apply(txn, self._state(txn))
+            finally:
+                txn.metadata.pop("_commit_read_checkpoint_target", None)
+                self.manager.interceptor.reset_agent_interval(txn)
             return
         interval = self._policy_invocation_ops(txn)
         completed = int(txn.context.completed_operations)
@@ -483,6 +549,104 @@ class PaperATCCHooks(NoopTransactionHooks):
         self.manager.interceptor.account_agent_interval(txn)
         self.manager.refresh_atcc_priority(txn)
         self._select_and_apply(txn, self._state(txn))
+
+    def _observe_deferred_object(self, txn: Any, object_id: str, version: int, *, write: bool) -> None:
+        """Record an actually observed dependency for the optional late plan."""
+        plan = txn.metadata.get("_object_protection_plan")
+        if plan is None:
+            return
+        # Measured redo cost includes the current agent interval and the
+        # previous failed attempt's observed cost.  No synthetic future
+        # footprint is used; zero is a valid low-cost observation.
+        cost = max(
+            0.0,
+            float(getattr(txn.context, "agent_cost_ms", 0.0) or 0.0),
+            float(getattr(txn.context, "prior_retry_cost_ms", 0.0) or 0.0),
+        )
+        plan.observe(str(object_id), int(version), write=bool(write), observed_redo_cost_ms=cost)
+
+    def _nominate_deferred_objects(self, txn: Any, action: Any) -> int:
+        """Nominate observed high-cost objects compatible with an action."""
+        plan = txn.metadata.get("_object_protection_plan")
+        if plan is None:
+            return 0
+        nominated = 0
+        current_cost = max(
+            0.0,
+            float(getattr(txn.context, "agent_cost_ms", 0.0) or 0.0),
+            float(getattr(txn.context, "prior_retry_cost_ms", 0.0) or 0.0),
+        )
+        for key, observed in tuple(plan.observed.items()):
+            # Refresh the measured cost at the checkpoint.  This is still
+            # the same observed version/object, never a future footprint.
+            plan.observe(key, observed.version, write=observed.write,
+                         observed_redo_cost_ms=current_cost)
+            observed = plan.observed[key]
+            hot = key in txn.context.hot_read_targets or key in txn.context.hot_write_targets
+            protects = action.protects(hot=hot, write=bool(observed.write))
+            if protects and plan.nominate(key):
+                nominated += 1
+        txn.metadata["_deferred_plan_nominations"] = int(
+            txn.metadata.get("_deferred_plan_nominations", 0) or 0
+        ) + nominated
+        return nominated
+
+    def _materialize_deferred_objects(self, txn: Any) -> int:
+        """Validate and lock only nominated observed objects at commit."""
+        plan = txn.metadata.get("_object_protection_plan")
+        if plan is None:
+            return 0
+        acquired = []
+        def validate_and_lock(target):
+            if (target.object_id in txn.context.held_write_locks
+                    or (not target.write and target.object_id in txn.context.held_read_locks)):
+                return
+            self.manager.refresh_atcc_priority(txn)
+            current = lambda key=target.object_id: int(self.manager.version_manager.read_committed(key).version)
+            if target.write:
+                self.manager.atcc_locks.validate_and_wlock(
+                    target.object_id, txn.context, int(target.version), current)
+                txn.context.policy_write_lock_targets.add(target.object_id)
+            else:
+                self.manager.atcc_locks.validate_and_rlock(
+                    target.object_id, txn.context, int(target.version), current)
+                txn.context.policy_read_lock_targets.add(target.object_id)
+        acquired = plan.materialize(
+            validate_and_lock,
+            held_reads=txn.context.held_read_locks,
+            held_writes=txn.context.held_write_locks,
+        )
+        txn.metadata["_deferred_plan_materialized"] = int(
+            txn.metadata.get("_deferred_plan_materialized", 0) or 0
+        ) + len(acquired)
+        return len(acquired)
+
+    def before_expensive_operation(self, txn: Any, delay_ms: int) -> None:
+        """Full-only checkpoint after the observed prefix and before reasoning.
+
+        This does not reveal a future object or conflict: the policy sees only
+        the state accumulated by operations that have already completed.  The
+        delay value is used solely to recognize the configured expensive-op
+        boundary and is not injected into the policy state.
+        """
+        if not getattr(self.manager, "expensive_operation_checkpoint_enabled", False):
+            return
+        if not self.enabled(txn) or txn.metadata.get("_cold_occ_fast_task", False):
+            return
+        if txn.metadata.get("_expensive_operation_checkpoint_active", False):
+            return
+        txn.metadata["_expensive_operation_checkpoint_active"] = True
+        try:
+            self.manager.interceptor.account_agent_interval(txn)
+            self.manager.refresh_atcc_priority(txn)
+            self._select_and_apply(txn, self._state(txn))
+            txn.metadata["_expensive_operation_checkpoints"] = int(
+                txn.metadata.get("_expensive_operation_checkpoints", 0) or 0
+            ) + 1
+        finally:
+            txn.metadata.pop("_expensive_operation_checkpoint_active", None)
+            self.manager.interceptor.reset_agent_interval(txn)
+
 
     @staticmethod
     def _policy_invocation_ops(txn: Any) -> int:
@@ -544,6 +708,29 @@ class PaperATCCHooks(NoopTransactionHooks):
             self.mark_online_bypass_read(txn, object_id)
 
     def _select_and_apply(self, txn: Any, state: Any) -> None:
+        if (
+            getattr(self.manager, "learned_checkpoint_only", False)
+            and not txn.metadata.get("_expensive_operation_checkpoint_active", False)
+        ):
+            # A timed action selected at the shared expensive-operation
+            # checkpoint is a plan, not an immediate lock acquisition.  It
+            # must still be materialized at commit even though checkpoint-only
+            # policies do not perform another lookup there.
+            pending = LockClass(int(txn.metadata.get("_pending_policy_protection", 0)))
+            is_commit = str(getattr(state, "phase", "")).strip().lower() == "commit"
+            if is_commit and pending != LockClass.NONE:
+                txn.metadata.pop("_pending_policy_protection", None)
+                selected = LockAction(txn.context.action.protected | pending)
+                txn.metadata["_deferred_policy_materializations"] = int(
+                    txn.metadata.get("_deferred_policy_materializations", 0)
+                ) + 1
+                if selected.protected != txn.context.action.protected:
+                    self.manager.transition_atcc_action(
+                        txn,
+                        selected,
+                        timeout_s=self._action_transition_timeout_s(txn),
+                    )
+            return
         policy_started = time.perf_counter()
         policy = self.manager.paper_policy.snapshot()
         distribution_sampler = getattr(policy, "select_with_distribution", None)
@@ -551,7 +738,7 @@ class PaperATCCHooks(NoopTransactionHooks):
         if distribution_sampler is not None:
             selected, behavior_action_probabilities = distribution_sampler(state)
             behavior_probability = behavior_action_probabilities[
-                int(selected.protected)
+                int(getattr(selected, "encoded", int(selected.protected)))
             ]
         else:
             sampler = getattr(policy, "select_with_probability", None)
@@ -560,25 +747,94 @@ class PaperATCCHooks(NoopTransactionHooks):
             else:
                 selected = policy.select(state)
                 behavior_probability = 1.0
+        # PPO's likelihood belongs to the sampled proposal, not to the action
+        # subsequently transformed by safety/performance guards. Recording a
+        # guarded mask with the proposal's probability corrupts pi(a|s)/q(a|s).
+        # Guards still execute unchanged; their actual effects remain in the
+        # action-change events and the resulting rewards / next state.
+        sampled_proposal = selected
+        refresh=getattr(self.manager,'paper_policy_refresh',None)
+        if refresh is not None:
+            refresh.record_lookup(getattr(policy,'last_lookup_distance',None))
         self._update_native_occ_hysteresis(txn, state)
         if self._low_conflict_occ_guard(txn, state):
             selected = LockAction(LockClass.NONE)
-        selected = LockAction(selected.protected | txn.context.action.protected)
+        selected = LockAction(
+            (selected.protected if getattr(self.manager,'allow_future_action_mask_reduction',False)
+             else selected.protected | txn.context.action.protected),
+            defer_to_commit=bool(getattr(selected, "defer_to_commit", False)),
+        )
         selected = self._apply_protection_guard(txn, state, selected)
+        # In the opt-in phase-scheduling experiment, an early decision is a
+        # *plan* rather than an instruction to acquire locks immediately.  At
+        # commit we materialize the union of all nominated protection and the
+        # current decision.  The context action remains the actual held-lock
+        # mask, therefore no lock can be removed by this mechanism.
+        planned = selected
+        is_commit = str(getattr(state, "phase", "")).strip().lower() == "commit"
+        pending_before_commit = LockClass(
+            int(txn.metadata.get("_pending_policy_protection", 0))
+        )
+        defer_until_commit = bool(
+            getattr(selected, "defer_to_commit", False)
+            or getattr(self.manager, "defer_policy_protection_until_commit", False)
+            or (is_commit and pending_before_commit != LockClass.NONE)
+        )
+        object_plan_enabled = bool(
+            getattr(self.manager, "deferred_object_plan_enabled", False)
+            and txn.metadata.get("_object_protection_plan") is not None
+        )
+        if object_plan_enabled and defer_until_commit:
+            # The learned category action is converted into nominations over
+            # the exact objects already observed by this attempt.  It does
+            # not acquire a class-wide lock during the reasoning interval.
+            self._nominate_deferred_objects(txn, planned)
+            if is_commit:
+                self._materialize_deferred_objects(txn)
+            selected = LockAction(txn.context.action.protected)
+            txn.metadata["_deferred_policy_materializations"] = int(
+                txn.metadata.get("_deferred_policy_materializations", 0) or 0
+            ) + int(is_commit)
+        elif defer_until_commit and not is_commit:
+            pending = LockClass(
+                int(txn.metadata.get("_pending_policy_protection", 0))
+            )
+            pending |= planned.protected
+            txn.metadata["_pending_policy_protection"] = int(pending)
+            txn.metadata["_deferred_policy_plan_count"] = int(
+                txn.metadata.get("_deferred_policy_plan_count", 0)
+            ) + 1
+            txn._event(
+                "action-plan-deferred",
+                {"planned": int(pending), "phase": str(getattr(state, "phase", ""))},
+            )
+            selected = LockAction(txn.context.action.protected)
+        elif defer_until_commit:
+            pending = LockClass(
+                int(txn.metadata.pop("_pending_policy_protection", 0))
+            )
+            selected = LockAction(
+                txn.context.action.protected | pending | planned.protected
+            )
+            txn.metadata["_deferred_policy_materializations"] = int(
+                txn.metadata.get("_deferred_policy_materializations", 0)
+            ) + int(pending != LockClass.NONE)
         self.manager.add_commit_timing(
             txn,
             "policy",
             (time.perf_counter() - policy_started) * 1000.0,
         )
         if self.manager.collect_trajectories:
+            recorded_proposal = sampled_proposal if behavior_action_probabilities else planned
             self.manager.trajectory_collector.decision(
                 txn.context.tid,
                 state,
-                int(selected.protected),
+                int(getattr(recorded_proposal, "encoded", int(recorded_proposal.protected))),
                 behavior_probability,
                 blocked_time_ms=txn.context.blocked_time_ms,
                 lock_count=self._lock_count(txn),
                 behavior_action_probabilities=behavior_action_probabilities,
+                monotone_actions=getattr(policy,'monotone_actions',True),
                 **self._externality_metrics(txn),
             )
         if selected.protected != txn.context.action.protected:
@@ -586,10 +842,16 @@ class PaperATCCHooks(NoopTransactionHooks):
                 txn,
                 selected,
                 timeout_s=self._action_transition_timeout_s(txn),
+                allow_mask_reduction=getattr(self.manager,'allow_future_action_mask_reduction',False),
             )
             # Action-transition lock wait is represented by Blocked(T), not
             # the separate inter-round agent interval in the priority formula.
             self.manager.interceptor.reset_agent_interval(txn)
+        if getattr(self.manager, 'reconcile_selected_reads_at_checkpoints', False):
+            self.manager.reconcile_selected_read_protection(
+                txn, timeout_s=self._action_transition_timeout_s(txn))
+        if getattr(self.manager, 'cost_aware_read_elision', False):
+            self.manager.reconcile_costly_read_protection(txn)
         self._finish_online_observed_prefix(txn)
 
     @staticmethod
@@ -718,7 +980,8 @@ class PaperATCCHooks(NoopTransactionHooks):
                 return LockAction(
                     txn.context.action.protected
                     | (selected.protected & LockClass.HOT_READ)
-                    | (LockClass.HOT_READ if observed_hot_reads else LockClass.NONE)
+                    | (LockClass.HOT_READ if observed_hot_reads else LockClass.NONE),
+                    defer_to_commit=bool(getattr(selected, "defer_to_commit", False)),
                 )
             return selected
         read_targets = set(txn.context.read_versions)
@@ -802,6 +1065,16 @@ class PaperATCCHooks(NoopTransactionHooks):
         ):
             guarded |= LockClass.HOT_READ
         if (
+            getattr(self.manager, "force_agent_phase_protection", False)
+            and workload == "ycsb"
+            and txn.context.phase == TransactionPhase.REFINE
+            and bool(txn.context.read_versions)
+        ):
+            # Once a concrete dependency has been observed in refine, protect
+            # that dependency before the long agent interval. The initial
+            # explore read remains optimistic and no future footprint is used.
+            guarded |= LockClass.HOT_READ | LockClass.COLD_READ
+        if (
             engineering_guards
             and hot_reads
             and validation_pressure >= 0.30
@@ -813,7 +1086,9 @@ class PaperATCCHooks(NoopTransactionHooks):
             # read lock. Cold bits are introduced only by retry evidence.
             guarded |= LockClass.HOT_READ
         if guarded != selected.protected:
-            return LockAction(guarded)
+            return LockAction(
+                guarded, defer_to_commit=bool(getattr(selected, "defer_to_commit", False))
+            )
         return selected
 
     @staticmethod
@@ -841,8 +1116,8 @@ class PaperATCCHooks(NoopTransactionHooks):
             and txn.context.action.protected == LockClass.NONE
             and txn.context.retry_count <= 0
             and not txn.context.retry_conflict_mask
-            and not txn.context.hot_read_targets
-            and not txn.context.hot_write_targets
+            and (self.manager.conflict_driven_fast_path or not txn.context.hot_read_targets)
+            and (self.manager.conflict_driven_fast_path or not txn.context.hot_write_targets)
             and float(getattr(state, "global_conflict_abort_rate", 0.0) or 0.0)
             <= 0.001
             and int(getattr(state, "global_waiter_count", 0) or 0) == 0
@@ -877,12 +1152,31 @@ class PaperATCCHooks(NoopTransactionHooks):
             **self._externality_metrics(txn),
         )
 
-    @staticmethod
-    def _native_occ_outcome_risk(txn: Any) -> bool:
+    def _native_occ_outcome_risk(self, txn: Any) -> bool:
         result = getattr(txn, "result", None)
-        reason = str(getattr(result, "reason", "") or "").strip().lower()
+        # Commit results may use explanatory text (e.g. "atomic version check
+        # failed"), while the context stores its normalized conflict kind.
+        # Any failed task must revoke a cold fast-path admission; matching only
+        # a short list of result strings can silently miss native OCC failures.
+        reason = str(getattr(txn.context, "recent_conflict_kind", "") or "").strip().lower()
+        if self.manager.conflict_driven_fast_path:
+            metrics = self.manager.paper_runtime_metrics()
+            # Frequency alone does not imply conflicting writers. Retain the
+            # original validated OCC implementation, but admit its fast path
+            # from observed outcomes rather than static/shared-read frequency.
+            # Never admit retries, failed attempts, protection or lock pressure.
+            return bool(
+                not bool(getattr(result, "committed", False))
+                or txn.context.retry_count > 0
+                or txn.context.retry_conflict_mask
+                or txn.context.action.protected != LockClass.NONE
+                or txn.context.blocked_time_ms > 0
+                or float(metrics["conflict_abort_rate"]) > .001
+                or int(metrics["waiter_count"]) > 0
+            )
         return bool(
-            txn.context.action.protected != LockClass.NONE
+            not bool(getattr(result, "committed", False))
+            or txn.context.action.protected != LockClass.NONE
             or txn.context.hot_read_targets
             or txn.context.hot_write_targets
             or reason in {
@@ -907,6 +1201,10 @@ class PaperATCCHooks(NoopTransactionHooks):
         self.manager.leave_online_observed_prefix()
 
     def _state(self, txn: Any) -> Any:
+        collect_reviewer=getattr(self.manager,'collect_reviewer_contention_statistics',True)
+        if not collect_reviewer and getattr(self.manager.paper_policy.snapshot(),
+                'requires_reviewer_contention_statistics',True):
+            raise ValueError('Installed policy requires omitted reviewer contention summaries')
         hotness_started = time.perf_counter()
         self.manager.refresh_hot_targets(txn)
         self.manager.add_commit_timing(
@@ -914,7 +1212,34 @@ class PaperATCCHooks(NoopTransactionHooks):
             "hotness",
             (time.perf_counter() - hotness_started) * 1000.0,
         )
-        state = self.manager.state_collector.snapshot(txn.context)
+        if getattr(self.manager, "protection_relevant_hotness", False):
+            targets = set(txn.context.write_targets)
+            targets.update(key for key in txn.context.read_versions
+                           if self.manager.category_read_lock_needed(txn, key))
+            state = self.manager.state_collector.snapshot(
+                txn.context, protection_relevant_targets=targets, include_observed_writes=True)
+        else:
+            state = self.manager.state_collector.snapshot(txn.context)
+        # A rule baseline may use this summary to make its single threshold
+        # local to an already-observed object, rather than using a global
+        # abort rate.  It sees only past access/conflict counters maintained
+        # by HotnessTracker; no planned or future object is exposed.
+        observed_targets = set(txn.context.read_versions) | set(txn.context.write_targets)
+        local_accesses = 0
+        local_rate = 0.0
+        local_recent_accesses = 0
+        for key in observed_targets:
+            if collect_reviewer:
+                heat = self.manager.hotness_tracker.object_snapshot(key)
+                accesses = int(heat.get("accesses", 0) or 0)
+                conflicts = int(heat.get("conflicts", 0) or 0)
+                local_accesses = max(local_accesses, accesses)
+                if accesses:
+                    local_rate = max(local_rate, conflicts / accesses)
+            local_recent_accesses = max(
+                local_recent_accesses,
+                self.manager.hotness_tracker.recent_access_count(key, window_ms=1000.0),
+            )
         metrics = self.manager.paper_runtime_metrics()
         return dataclasses.replace(
             state,
@@ -930,15 +1255,23 @@ class PaperATCCHooks(NoopTransactionHooks):
             global_conflict_abort_rate=float(metrics["conflict_abort_rate"]),
             global_background_throughput=float(metrics["background_throughput"]),
             global_background_abort_rate=float(metrics["background_abort_rate"]),
+            max_observed_hot_accesses=local_accesses,
+            max_observed_hot_contention_rate=local_rate,
+            max_observed_recent_accesses=local_recent_accesses,
         )
 
     @staticmethod
     def _externality_metrics(txn: Any) -> dict[str, float | int]:
         context = txn.context
+        helper = dict(agent_blocked_ms_caused=0., background_blocked_ms_caused=0.)
+        coordinator = getattr(getattr(txn, "manager", None), "_coordinated_admission", None)
+        if coordinator is not None and coordinator.record_externalities:
+            helper = coordinator.externalities_for(context.tid)
+            txn.manager.trajectory_collector.note_helper_externalities(context.tid, helper)
         return {
-            "background_blocked_ms_caused": context.background_blocked_ms_caused,
+            "background_blocked_ms_caused": context.background_blocked_ms_caused + helper["background_blocked_ms_caused"],
             "background_aborts_caused": context.background_aborts_caused,
-            "agent_blocked_ms_caused": context.agent_blocked_ms_caused,
+            "agent_blocked_ms_caused": context.agent_blocked_ms_caused + helper["agent_blocked_ms_caused"],
             "agent_aborts_caused": context.agent_aborts_caused,
         }
 

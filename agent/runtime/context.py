@@ -35,6 +35,22 @@ class LockClass(enum.IntFlag):
 @dataclasses.dataclass(frozen=True)
 class LockAction:
     protected: LockClass = LockClass.NONE
+    # Experimental timing bit.  It is intentionally separate from the four
+    # requested protection classes. Actual lock ownership is maintained by
+    # held_read_locks / held_write_locks, independently of this request mask.
+    defer_to_commit: bool = False
+
+    @property
+    def encoded(self) -> int:
+        """Stable action id: [0,15] immediate; [16,31] commit-deferred."""
+        return int(self.protected) | (16 if self.defer_to_commit else 0)
+
+    @classmethod
+    def from_encoded(cls, action: int) -> "LockAction":
+        value = int(action)
+        if value < 0 or value >= 32:
+            raise ValueError("invalid timed lock action")
+        return cls(LockClass(value & 0xF), defer_to_commit=bool(value & 16))
 
     def expands(self, previous: "LockAction") -> bool:
         return (self.protected | previous.protected) == self.protected
@@ -82,6 +98,7 @@ class TransactionContext:
     priority_epoch: int = 0
     operation_cost_ms: float = 0.0
     agent_cost_ms: float = 0.0
+    inflight_agent_started_ns: int = 0
     blocked_time_ms: float = 0.0
     retry_count: int = 0
     retry_validation_conflicts: int = 0
@@ -89,6 +106,9 @@ class TransactionContext:
     retry_conflict_read_targets: Set[str] = dataclasses.field(default_factory=set)
     retry_conflict_write_targets: Set[str] = dataclasses.field(default_factory=set)
     prior_retry_cost_ms: float = 0.0
+    # Actual lock wait from earlier attempts of this logical task; separate
+    # from paid agent work and this attempt's measured blocked time.
+    prior_retry_blocked_ms: float = 0.0
     recent_conflict_kind: str = "none"
     is_background: bool = False
     background_blocked_ms_caused: float = 0.0
@@ -152,9 +172,12 @@ class TransactionContext:
                 self.phase = phase
                 self.round_index += 1
 
-    def change_action(self, action: LockAction) -> LockClass:
+    def change_action(self, action: LockAction, *, allow_mask_reduction: bool = False) -> LockClass:
         with self._mutex:
-            added = action.added_since(self.action)
+            # Optional future-access mask revision is not an unlock. Held S/X
+            # sets have an independent lifetime, still ending only at terminal.
+            added = (action.protected & ~self.action.protected if allow_mask_reduction
+                     else action.added_since(self.action))
             self.action = action
             return added
 

@@ -205,13 +205,11 @@ def main() -> int:
         policy_invocation_ops=args.policy_invocation_ops,
     )
     experiment_context["client_think_ms"] = max(0, int(args.client_think_ms))
-    # Generate enough tasks to match the original mixed benchmark's worker
-    # stride pattern without cycling for the requested fixed trace length.
-    task_count = max(256, agent_workers * args.transactions_per_worker)
-    bg_task_count = max(
-        512,
-        max(1, background_workers) * background_transactions_per_worker,
-    )
+    # Keep bounded supplementary traces proportional to the requested worker
+    # count. The full paper matrix uses a larger floor, but that floor makes a
+    # real multi-second reasoning replay unnecessarily long.
+    task_count = max(agent_workers, agent_workers * args.transactions_per_worker)
+    bg_task_count = max(1, background_workers) * background_transactions_per_worker
     agent_tasks = list(workload.generate_tasks(task_count, seed=args.seed))
     background_tasks = list(workload.generate_tasks(bg_task_count, seed=args.seed + 700_000))
     profile = ReasoningProfile(

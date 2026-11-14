@@ -7,6 +7,8 @@ import threading
 import time
 from typing import Any, Dict, Iterable, List, Tuple
 
+CONFLICT_SIGNAL_SCHEMA = 'runtime-contention-v2'
+
 
 class LockConflict(RuntimeError):
     def __init__(
@@ -26,7 +28,17 @@ def normalize_conflict_kind(value: str) -> str:
     normalized = str(value).strip().lower()
     if not normalized or normalized == "none":
         return "none"
-    if "retroactive" in normalized or "version" in normalized or "atomic version" in normalized:
+    # These runtime commit/admission failures are genuine ownership conflicts,
+    # even though their explanatory strings do not contain "lock"/"version".
+    # Keep application/tool errors outside the contention feedback signal.
+    if normalized in {
+        'optimistic read conflicts with committing writer',
+        'commit-admission-conflict',
+        'background-admission-busy',
+    }:
+        return 'lock-conflict'
+    if ("retroactive" in normalized or "version" in normalized or "atomic version" in normalized
+            or normalized == "pre-expensive observed prefix is stale"):
         return "version-conflict"
     if "wound" in normalized or "preempt" in normalized or "aborted while waiting" in normalized:
         return "lock-preempted"

@@ -20,6 +20,8 @@ class CreditReviewConfig:
     reasoning_scale: float = 1.0
     commit_apply_ms: int = 24
     compliance_shards: int = 4
+    coordination_partitions: int = 1
+    mutable_read_before_reasoning: bool = False
 
     def normalized(self) -> "CreditReviewConfig":
         if int(self.company_count) < 8:
@@ -34,6 +36,8 @@ class CreditReviewConfig:
             raise ValueError("commit_apply_ms must be non-negative")
         if int(self.compliance_shards) < 2:
             raise ValueError("compliance_shards must be at least 2")
+        if int(self.coordination_partitions) < 1:
+            raise ValueError("coordination_partitions must be positive")
         return dataclasses.replace(
             self,
             company_count=int(self.company_count),
@@ -43,6 +47,8 @@ class CreditReviewConfig:
             reasoning_scale=float(self.reasoning_scale),
             commit_apply_ms=int(self.commit_apply_ms),
             compliance_shards=int(self.compliance_shards),
+            coordination_partitions=int(self.coordination_partitions),
+            mutable_read_before_reasoning=bool(self.mutable_read_before_reasoning),
         )
 
 
@@ -60,6 +66,8 @@ class CreditReviewExecution:
     branch: str
     revealed_targets: tuple[str, ...]
     commit_admission_wait_ms: float = 0.0
+    blocked_ms: float = 0.0
+    lock_hold_ms: float = 0.0
 
 
 class CreditReviewWorkload:
@@ -116,7 +124,10 @@ class CreditReviewWorkload:
         for risk, factor in (("low", 12), ("medium", 0), ("high", -18)):
             yield ObjectSpec(f"credit:policy:{risk}", str(factor), kind="row")
             yield ObjectSpec(f"credit:risk:{risk}:review_queue", "none", kind="row")
-        for committee in range(4):
+            for partition in range(self.config.coordination_partitions):
+                if self.config.coordination_partitions > 1:
+                    yield ObjectSpec(f"credit:risk:{risk}:review_queue:{partition}", "none", kind="row")
+        for committee in range(4 * self.config.coordination_partitions):
             yield ObjectSpec(
                 f"credit:committee:{committee}:last_decision",
                 "none",
@@ -173,9 +184,11 @@ class CreditReviewWorkload:
                     kind="row",
                 )
 
-    def register(self, manager: Any) -> None:
+    def register(self, manager: Any, *, storage_for: Callable[[ObjectSpec], str] | None = None) -> None:
         for spec in self.objects():
-            manager.register_object(spec.object_id, spec.initial_value, kind=spec.kind)
+            storage_id = storage_for(spec) if storage_for else "default"
+            manager.register_object(spec.object_id, spec.initial_value, kind=spec.kind,
+                                    storage_id=storage_id)
 
     def task_for(self, *, seed: int, worker_id: int, sequence: int) -> CreditReviewTaskSpec:
         task_seed = stable_u64("task", seed, worker_id, sequence)
@@ -191,8 +204,12 @@ class CreditReviewWorkload:
         task: CreditReviewTaskSpec,
         *,
         sleep_fn: Callable[[float], None] = time.sleep,
+        reasoner: Any | None = None,
+        tool: Any | None = None,
+        trace: list[dict[str, Any]] | None = None,
     ) -> "CreditReviewCursor":
-        return CreditReviewCursor(self, task, sleep_fn=sleep_fn)
+        return CreditReviewCursor(self, task, sleep_fn=sleep_fn, reasoner=reasoner,
+                                  tool=tool, trace=trace)
 
     @staticmethod
     def company_prefix(company_id: int) -> str:
@@ -206,10 +223,18 @@ class CreditReviewCursor:
         task: CreditReviewTaskSpec,
         *,
         sleep_fn: Callable[[float], None] = time.sleep,
+        reasoner: Any | None = None,
+        tool: Any | None = None,
+        trace: list[dict[str, Any]] | None = None,
     ):
         self.workload = workload
         self.task = task
         self.sleep_fn = sleep_fn
+        self.reasoner = reasoner
+        self.tool = tool
+        self.trace = trace
+        self.started_at = time.perf_counter()
+        self.last_observation = ""
         self.reasoning_ms = 0
         self.reasoning_tokens = 0
         self.operation_count = 0
@@ -229,6 +254,13 @@ class CreditReviewCursor:
         txn.enter_phase("explore")
         profile = self._read(txn, f"{prefix}:profile", "profile", "explore", before_access)
         sector, region, risk = parse_profile(profile)
+        if self.reasoner is not None:
+            # The model's answer selects the actual evidence path.  A wrong
+            # answer is an explicit task failure, never silently corrected.
+            chosen = self._llm("evidence-route", "explore", f"profile={profile}").lower()
+            if chosen not in {"low", "medium", "high"}:
+                raise ValueError(f"invalid LLM evidence route: {chosen!r}")
+            risk = chosen
         self.branch = risk
         payments = to_int(
             self._read(txn, f"{prefix}:payments", "payments", "explore", before_access)
@@ -301,8 +333,12 @@ class CreditReviewCursor:
             branch_evidence = collateral - 5 * watchlist
 
         score = payments + financials // 20 + outlook + regulation + branch_evidence // 5
-        committee = abs(score) % 4
+        partition = self.task.company_id % self.workload.config.coordination_partitions
+        committee = abs(score) % 4 + 4 * partition
         compliance_shard = committee % self.workload.config.compliance_shards
+        review_queue = f"credit:risk:{risk}:review_queue"
+        if self.workload.config.coordination_partitions > 1:
+            review_queue += f":{partition}"
         txn.enter_phase("commit")
         commit_targets = (
             f"{prefix}:limit",
@@ -310,42 +346,66 @@ class CreditReviewCursor:
             f"credit:portfolio:{sector}:{region}:last_decision",
             f"credit:sector:{sector}:exposure",
             f"credit:region:{region}:exposure",
-            f"credit:risk:{risk}:review_queue",
+            review_queue,
             f"credit:committee:{committee}:last_decision",
             f"credit:compliance:{compliance_shard}:decision_log_head",
             f"credit:compliance:{compliance_shard}:decision_sequence",
             f"{prefix}:audit",
             f"{prefix}:outbox",
         )
-        for label in (
+        current_limit = None
+        labels = (
             "current-limit",
             "credit-limit",
             "risk-status",
             "portfolio-decision",
             "audit",
             "outbox",
-        ):
+        )
+        if self.workload.config.mutable_read_before_reasoning:
+            # Controlled long-read-window variant, OFF in the paper workload.
+            # Move the existing read before the recommendation reasoning; do
+            # not add SQL operations, sleeps, tokens, or a future footprint.
+            self._reason(labels[0], "commit")
+            current_limit = to_int(self._read(txn, f"{prefix}:limit", "current-limit", "commit",
+                                             before_access, reason=False))
+            labels = labels[1:]
+        for label in labels:
             self._reason(label, "commit")
-        # The external service completes before the final state-dependent read
-        # for every concurrency-control system. Aegis may then admit the
-        # materialized hot suffix, but it does not receive a different
-        # operation order from the baselines.
-        self.sleep_fn(self.workload.config.commit_apply_ms / 1000.0)
+        # Default: external service precedes the final state-dependent read.
+        # Controlled variant: current limit has already been read and remains
+        # exposed during the same reasoning/service interval for ALL systems.
+        # The suffix helper is still called only after that interval.
+        external_started = time.perf_counter()
+        if self.tool is None:
+            self.sleep_fn(self.workload.config.commit_apply_ms / 1000.0)
+            self._trace_event("external_tool", "commit", "apply-service", external_started,
+                              transport="simulated")
+        else:
+            verification = self.tool.apply({"company_id": self.task.company_id,
+                                            "task_seed": self.task.task_seed,
+                                            "risk": risk, "score": score})
+            if verification.get("verified") is not True:
+                raise ValueError("external credit verification rejected task")
+            self._trace_event("external_tool", "commit", "verification-service",
+                              external_started, transport="http-or-replay",
+                              receipt_id=verification.get("receipt_id", ""))
         if before_commit_batch is not None:
             self.commit_admission_wait_ms += max(
                 0.0,
                 float(before_commit_batch(txn, commit_targets)),
             )
-        current_limit = to_int(
-            self._read(
-                txn,
-                f"{prefix}:limit",
-                "current-limit",
-                "commit",
-                before_access,
-                reason=False,
+        if current_limit is None:
+            current_limit = to_int(
+                self._read(
+                    txn,
+                    f"{prefix}:limit",
+                    "current-limit",
+                    "commit",
+                    before_access,
+                    reason=False,
+                )
             )
-        )
         decision_sequence = to_int(
             self._read(
                 txn,
@@ -411,7 +471,7 @@ class CreditReviewCursor:
         )
         self._write(
             txn,
-            f"credit:risk:{risk}:review_queue",
+            review_queue,
             f"{self.task.company_id}:{decision}:{score}",
             "risk-queue",
             "commit",
@@ -492,9 +552,13 @@ class CreditReviewCursor:
                 0.0,
                 float(before_access(txn, "read", object_id) or 0.0),
             )
+        started = time.perf_counter()
+        value = str(txn.read(object_id).value)
+        self._trace_event("read", phase, label, started, object_id=object_id)
+        self.last_observation = f"{label}={value}"
         self.revealed_targets.append(str(object_id))
         self.operation_count += 1
-        return str(txn.read(object_id).value)
+        return value
 
     def _write(
         self,
@@ -516,9 +580,35 @@ class CreditReviewCursor:
             )
         self.revealed_targets.append(str(object_id))
         self.operation_count += 1
+        started = time.perf_counter()
         txn.write(object_id, value)
+        self._trace_event("write", phase, label, started, object_id=object_id)
+
+    def _trace_event(self, event: str, phase: str, label: str, started: float,
+                     **detail: Any) -> None:
+        if self.trace is not None:
+            self.trace.append(dict(event=event, phase=phase, label=label,
+                                   offset_ms=(started-self.started_at)*1000,
+                                   elapsed_ms=(time.perf_counter()-started)*1000,
+                                   **detail))
+
+    def _llm(self, label: str, phase: str, context: str) -> str:
+        started = time.perf_counter()
+        result = self.reasoner.reason(label=label, phase=phase, context=context)
+        elapsed = (time.perf_counter()-started)*1000
+        self.reasoning_ms += round(elapsed)
+        self.reasoning_tokens += result.input_tokens + result.output_tokens
+        self._trace_event("llm", phase, label, started, model=result.model,
+                          response_id=result.response_id, input_tokens=result.input_tokens,
+                          output_tokens=result.output_tokens, output=result.text,
+                          context=context, admission_wait_ms=result.admission_wait_ms,
+                          model_service_elapsed_ms=max(0.0, elapsed-result.admission_wait_ms))
+        return result.text.strip()
 
     def _reason(self, label: str, phase: str) -> None:
+        if self.reasoner is not None:
+            self._llm(label, phase, self.last_observation)
+            return
         delay_ranges = {
             "explore": (10, 24),
             "refine": (14, 30),

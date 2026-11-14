@@ -3,6 +3,8 @@
 
 import argparse
 import csv
+import json
+import math
 import os
 import re
 import signal
@@ -137,6 +139,8 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--run-timeout", type=float, default=0.0, help="Per-row wall-clock timeout in seconds; 0 disables.")
     parser.add_argument("--algorithms", default="", help="Optional comma-separated CC_ALG override.")
+    parser.add_argument("--latency-traces", type=Path, nargs="+", default=[],
+                        help="Independent live CreditReview captures for phase delay IQR; no trace means original synthetic timing.")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--patch-script", type=Path, default=None)
     parser.add_argument("--smoke", action="store_true")
@@ -155,6 +159,11 @@ def main() -> int:
     clients = [int(x) for x in split_csv(args.client_counts)]
     ratios = [float(x) for x in split_csv(args.agent_ratios)]
     alg_override = split_csv(args.algorithms)
+    calibration = phase_latency_calibration(args.latency_traces) if args.latency_traces else {}
+    if calibration:
+        provenance = output.with_suffix(".calibration.json")
+        provenance.write_text(json.dumps({"captures": [str(p.resolve()) for p in args.latency_traces],
+                                          "phase_ranges_ms": calibration}, indent=2) + "\n")
 
     for system in systems:
         meta = SYSTEMS[system]
@@ -184,6 +193,7 @@ def main() -> int:
                                 run_timeout=args.run_timeout,
                                 repeat=repeat,
                                 alg=alg,
+                                calibration=calibration,
                             )
                             rows.append(row)
                             write_rows(output, rows)
@@ -219,6 +229,9 @@ def run_one(repo: Path, **kwargs) -> dict:
     duration = kwargs["duration"]
     config_file = "experiments/default.json" if workload == "ycsb" else "experiments/tpcc.json"
     overrides = common_overrides(**kwargs)
+    for phase, bounds in kwargs.get("calibration", {}).items():
+        overrides[f"CASTDAS_TRACE_{phase.upper()}_LO_MS"] = bounds["lo_ms"]
+        overrides[f"CASTDAS_TRACE_{phase.upper()}_HI_MS"] = bounds["hi_ms"]
     if workload == "ycsb":
         overrides.update(YCSB_LEVELS[level_key])
         overrides["WORKLOAD"] = "YCSB"
@@ -302,6 +315,27 @@ def common_overrides(**kwargs) -> dict:
         "OUTPUT_TO_FILE": "false",
         "NDEBUG": "true",
     }
+
+
+def phase_latency_calibration(paths: list[Path]) -> dict:
+    """Match the central spread of real provider latency, without tuning to CC outcomes."""
+    groups = {phase: [] for phase in ("explore", "refine", "commit")}
+    for path in paths:
+        trace = json.loads(path.read_text())
+        if trace.get("mode") != "live":
+            raise ValueError(f"latency calibration requires a live capture: {path}")
+        for task in trace["tasks"]:
+            for event in task["events"]:
+                if event["event"] == "llm" and event["phase"] in groups:
+                    groups[event["phase"]].append(float(event.get(
+                        "model_service_elapsed_ms", event["elapsed_ms"])))
+    if any(not values for values in groups.values()):
+        raise ValueError("live trace must include LLM calls in explore, refine and commit")
+    def quantile(values: list[float], q: float) -> int:
+        values = sorted(values)
+        return max(1, round(values[max(0, math.ceil(len(values) * q) - 1)]))
+    return {phase: {"lo_ms": quantile(values, .25), "hi_ms": quantile(values, .75),
+                    "samples": len(values)} for phase, values in groups.items()}
 
 
 def parse_summary(output: str) -> dict:

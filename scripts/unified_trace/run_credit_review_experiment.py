@@ -94,6 +94,28 @@ RAW_FIELDS = (
     "access_set_visibility",
     "admission_scope",
     "policy_commit_batch",
+    "performance_guards",
+    "tracked_history_import",
+    "conflict_driven_fast_path",
+    "unified_commit_admission",
+    "cycle_safe_hotspot_admission",
+    "cycle_safe_gate_wait_ms",
+    "cycle_safe_gate_admissions",
+    "cycle_safe_gate_bypasses",
+    "coordinated_hotspot_admission",
+    "commit_read_checkpoints",
+    "first_access_read_refresh",
+    "consistent_hotness_classification",
+    "helper_externality_accounting",
+    "helper_externality_recording_active",
+    "mutable_read_before_reasoning",
+    "coordinated_gate_admissions",
+    "coordinated_gate_cycle_bypasses",
+    "coordinated_gate_wait_calls",
+    "coordinated_gate_priority_overtakes",
+    "coordinated_gate_dependency_probes",
+    "coordinated_gate_timeouts",
+    "native_occ_fast_tasks",
     "observed_commit_admission",
     "planned_target_count",
     "error",
@@ -125,10 +147,15 @@ class WindowCounters:
     useful_tokens: int = 0
     total_tokens: int = 0
     operation_count: int = 0
+    blocked_ms: float = 0.0
+    lock_hold_ms: float = 0.0
     commit_admission_wait_ms: float = 0.0
     latencies_ms: list[float] = dataclasses.field(default_factory=list)
     branches: Counter[str] = dataclasses.field(default_factory=Counter)
     failures: Counter[str] = dataclasses.field(default_factory=Counter)
+    observed_failed_restart_cost_ms: float = 0.0
+    carried_prior_restart_cost_ms: float = 0.0
+    restart_cost_records: list[dict[str, Any]] = dataclasses.field(default_factory=list)
 
     def record_attempt(
         self,
@@ -136,11 +163,19 @@ class WindowCounters:
         committed: bool,
         execution: CreditReviewExecution,
         failure_reason: str,
+        observed_restart_cost_ms: float = 0.,
+        carried_prior_restart_cost_ms: float = 0.,
+        restart_cost_record: dict[str, Any] | None = None,
     ) -> None:
         with self.lock:
             self.attempts += 1
+            self.carried_prior_restart_cost_ms += float(carried_prior_restart_cost_ms)
+            if restart_cost_record is not None:
+                self.restart_cost_records.append(dict(restart_cost_record))
             self.total_tokens += int(execution.reasoning_tokens)
             self.operation_count += int(execution.operation_count)
+            self.blocked_ms += execution.blocked_ms
+            self.lock_hold_ms += execution.lock_hold_ms
             self.commit_admission_wait_ms += float(execution.commit_admission_wait_ms)
             if execution.branch:
                 self.branches[execution.branch] += 1
@@ -149,6 +184,7 @@ class WindowCounters:
                 self.useful_tokens += int(execution.reasoning_tokens)
             else:
                 self.aborts += 1
+                self.observed_failed_restart_cost_ms += float(observed_restart_cost_ms)
                 self.wasted_reasoning_ms += int(execution.reasoning_ms)
                 self.wasted_tokens += int(execution.reasoning_tokens)
                 self.failures[str(failure_reason or "unknown")] += 1
@@ -183,6 +219,8 @@ def main() -> int:
     parser.add_argument("--region-count", type=int, default=4)
     parser.add_argument("--zipf-theta", type=float, default=0.99)
     parser.add_argument("--reasoning-scale", type=float, default=1.0)
+    parser.add_argument("--mutable-read-before-reasoning", action="store_true",
+        help="Controlled long-read-window variant; preserves SQL count, reasoning and retry budgets.")
     parser.add_argument(
         "--retry-delay-scale",
         type=float,
@@ -209,6 +247,28 @@ def main() -> int:
     parser.add_argument("--paper-exploration-epsilon", type=float, default=0.2)
     parser.add_argument("--priority-quantum-scale", type=float, default=1.0)
     parser.add_argument("--performance-guards", action="store_true")
+    parser.add_argument("--tracked-history-import", action="store_true",
+        help="Import only invalidated lazy baselines; requires all writes through the manager.")
+    parser.add_argument("--conflict-driven-fast-path", action="store_true",
+        help="With performance guards, qualify cold OCC from observed conflicts, not frequency.")
+    parser.add_argument("--unified-commit-admission", action="store_true",
+        help="Use the existing ATCC priority scheduler instead of private commit-suffix gates.")
+    parser.add_argument("--coordinated-hotspot-admission", action="store_true",
+        help="Priority-aware atomic hotspot helper reservations with cross-resource cycle inspection.")
+    parser.add_argument("--round-interval-features", action="store_true",
+        help="Use observed per-round Agent gaps instead of the final bookkeeping gap in policy state.")
+    parser.add_argument("--commit-read-checkpoints", action="store_true",
+        help="Add policy checkpoints after already-observed Commit reads; retain phase checkpoints.")
+    parser.add_argument("--first-access-read-refresh", action="store_true",
+        help="For unobserved unpinned protected reads, lock before reading the committed value.")
+    parser.add_argument("--consistent-hotness-classification", action="store_true",
+        help="On unsampled accesses use observed hotness instead of treating known hot objects as cold.")
+    parser.add_argument("--helper-externality-accounting", action="store_true",
+        help="Record reservation-owner waiting externalities in collected policy trajectories.")
+    parser.add_argument("--cycle-safe-hotspot-admission", action="store_true",
+        help="Break nested private-gate waits under ATCC locks; retain normal commit validation.")
+    parser.add_argument("--cycle-safe-gate-wait-ms", type=float, default=0.,
+        help="Optional total bounded helper wait under ATCC locks; default zero/nonblocking.")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -225,12 +285,31 @@ def main() -> int:
         raise SystemExit("--retry-delay-scale must be non-negative")
     if args.priority_quantum_scale <= 0.0:
         raise SystemExit("--priority-quantum-scale must be positive")
+    if args.conflict_driven_fast_path and not args.performance_guards:
+        raise SystemExit("--conflict-driven-fast-path requires --performance-guards")
+    if sum((args.unified_commit_admission, args.cycle_safe_hotspot_admission,
+            args.coordinated_hotspot_admission)) > 1:
+        raise SystemExit("Choose one hotspot admission mode, not both")
+    if args.cycle_safe_gate_wait_ms < 0 or not math.isfinite(args.cycle_safe_gate_wait_ms):
+        raise SystemExit("cycle-safe gate wait must be finite and non-negative")
+    if args.cycle_safe_gate_wait_ms and not args.cycle_safe_hotspot_admission:
+        raise SystemExit("cycle-safe gate wait requires cycle-safe hotspot admission")
     if not 0.0 <= args.paper_exploration_epsilon <= 1.0:
         raise SystemExit("--paper-exploration-epsilon must be in [0, 1]")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     raw_path = args.output_dir / "credit_review_figure3_raw.csv"
     existing = [] if args.force else read_csv(raw_path)
+    prior_manifest=args.output_dir / "credit_review_manifest.json"
+    if existing and prior_manifest.exists():
+        previous=json.loads(prior_manifest.read_text(encoding="utf-8"))
+        for name in ("tracked_history_import","conflict_driven_fast_path","unified_commit_admission","cycle_safe_hotspot_admission","coordinated_hotspot_admission","round_interval_features","commit_read_checkpoints","first_access_read_refresh","consistent_hotness_classification","helper_externality_accounting"):
+            if bool(previous.get(name,False)) != bool(getattr(args,name)):
+                raise SystemExit("Optimization flags differ from existing evidence; use a fresh output directory")
+        if float(previous.get("cycle_safe_gate_wait_ms",0.)) != args.cycle_safe_gate_wait_ms:
+            raise SystemExit("Admission wait budget differs from existing evidence; use a fresh output directory")
+        if bool(previous.get("mutable_read_before_reasoning",False)) != args.mutable_read_before_reasoning:
+            raise SystemExit("Read exposure differs from existing evidence; use a fresh output directory")
     completed = {
         (int(row["clients"]), int(row["repeat"]), row["cc"])
         for row in existing
@@ -244,6 +323,7 @@ def main() -> int:
         zipf_theta=args.zipf_theta,
         reasoning_scale=args.reasoning_scale,
         commit_apply_ms=args.commit_apply_ms,
+        mutable_read_before_reasoning=args.mutable_read_before_reasoning,
     ).normalized()
     for client_count in clients:
         for repeat in range(args.repeats):
@@ -272,6 +352,17 @@ def main() -> int:
                         paper_priority=args.paper_priority,
                         priority_quantum_scale=args.priority_quantum_scale,
                         performance_guards=args.performance_guards,
+                        tracked_history_import=args.tracked_history_import,
+                        conflict_driven_fast_path=args.conflict_driven_fast_path,
+                        unified_commit_admission=args.unified_commit_admission,
+                        cycle_safe_hotspot_admission=args.cycle_safe_hotspot_admission,
+                        cycle_safe_gate_wait_ms=args.cycle_safe_gate_wait_ms,
+                        coordinated_hotspot_admission=args.coordinated_hotspot_admission,
+                        round_interval_features=args.round_interval_features,
+                        commit_read_checkpoints=args.commit_read_checkpoints,
+                        first_access_read_refresh=args.first_access_read_refresh,
+                        consistent_hotness_classification=args.consistent_hotness_classification,
+                        helper_externality_accounting=args.helper_externality_accounting,
                         observed_commit_admission=args.observed_commit_admission,
                         policy_commit_batch=args.policy_commit_batch,
                         trajectory_output=(
@@ -320,6 +411,19 @@ def main() -> int:
                 "paper_switching": args.paper_switching,
                 "paper_priority": args.paper_priority,
                 "delayed_write_apply": True,
+                "performance_guards": bool(args.performance_guards),
+                "tracked_history_import": bool(args.tracked_history_import),
+                "conflict_driven_fast_path": bool(args.conflict_driven_fast_path),
+                "unified_commit_admission": bool(args.unified_commit_admission),
+                "cycle_safe_hotspot_admission": bool(args.cycle_safe_hotspot_admission),
+                "cycle_safe_gate_wait_ms": float(args.cycle_safe_gate_wait_ms),
+                "coordinated_hotspot_admission": bool(args.coordinated_hotspot_admission),
+                "round_interval_features": bool(args.round_interval_features),
+                "commit_read_checkpoints": bool(args.commit_read_checkpoints),
+                "first_access_read_refresh": bool(args.first_access_read_refresh),
+                "consistent_hotness_classification": bool(args.consistent_hotness_classification),
+                "helper_externality_accounting": bool(args.helper_externality_accounting),
+                "mutable_read_before_reasoning": bool(args.mutable_read_before_reasoning),
                 "observed_commit_admission": bool(args.observed_commit_admission),
                 "policy_commit_batch": bool(args.policy_commit_batch),
                 "trajectory_dir": str(args.trajectory_dir.resolve()) if args.trajectory_dir else "",
@@ -359,9 +463,45 @@ def run_system(
     trajectory_output: Path | None = None,
     paper_exploration_seed: int | None = None,
     paper_exploration_epsilon: float = 0.2,
+    policy_override: object | None = None,
+    tracked_history_import: bool = False,
+    conflict_driven_fast_path: bool = False,
+    unified_commit_admission: bool = False,
+    cycle_safe_hotspot_admission: bool = False,
+    cycle_safe_gate_wait_ms: float = 0.,
+    coordinated_hotspot_admission: bool = False,
+    round_interval_features: bool = False,
+    commit_read_checkpoints: bool = False,
+    first_access_read_refresh: bool = False,
+    consistent_hotness_classification: bool = False,
+    helper_externality_accounting: bool = False,
+    observed_write_read_lock_elision: bool = False,
+    protection_relevant_hotness: bool = False,
+    unique_attempt_outcomes: bool = False,
+    carry_prior_restart_cost: bool = False,
 ) -> dict[str, Any]:
+    if conflict_driven_fast_path and not performance_guards:
+        raise ValueError("conflict-driven fast path requires performance guards")
+    if sum((unified_commit_admission, cycle_safe_hotspot_admission,
+            coordinated_hotspot_admission)) > 1:
+        raise ValueError("Choose one hotspot admission mode, not both")
+    if cycle_safe_gate_wait_ms < 0 or not math.isfinite(cycle_safe_gate_wait_ms):
+        raise ValueError("cycle-safe gate wait must be finite and non-negative")
+    if cycle_safe_gate_wait_ms and not cycle_safe_hotspot_admission:
+        raise ValueError("cycle-safe gate wait requires cycle-safe hotspot admission")
     workload = CreditReviewWorkload(config)
-    compiled_policy = CompiledPhasePolicy.load(paper_policy)
+    compiled_policy = policy_override if policy_override is not None else CompiledPhasePolicy.load(paper_policy)
+    encoder_policy = compiled_policy
+    encoder_seen = set()
+    while id(encoder_policy) not in encoder_seen:
+        encoder_seen.add(id(encoder_policy))
+        if (getattr(encoder_policy, "protection_relevant_hotness", False)
+                and not protection_relevant_hotness):
+            raise ValueError("policy requires protection-relevant hotness encoding")
+        nested = getattr(encoder_policy, "base", None)
+        if nested is None:
+            break
+        encoder_policy = nested
     if paper_exploration_seed is not None:
         compiled_policy = EpsilonGreedyPolicy(
             compiled_policy,
@@ -381,6 +521,20 @@ def run_system(
         performance_guards_enabled=bool(performance_guards),
         commit_admission_priority_enabled=False,
         delayed_write_apply_enabled=True,
+        tracked_history_import=tracked_history_import,
+        conflict_driven_fast_path=conflict_driven_fast_path,
+        unified_commit_admission=unified_commit_admission,
+        cycle_safe_hotspot_admission=cycle_safe_hotspot_admission,
+        cycle_safe_gate_wait_ms=cycle_safe_gate_wait_ms,
+        coordinated_hotspot_admission=coordinated_hotspot_admission,
+        round_interval_features=round_interval_features,
+        commit_read_checkpoints=commit_read_checkpoints,
+        first_access_read_refresh=first_access_read_refresh,
+        consistent_hotness_classification=consistent_hotness_classification,
+        helper_externality_accounting=helper_externality_accounting,
+        observed_write_read_lock_elision=observed_write_read_lock_elision,
+        protection_relevant_hotness=protection_relevant_hotness,
+        unique_attempt_outcomes=unique_attempt_outcomes,
         priority_config=PriorityConfig(
             sql_quantum_ms=10.0 * float(priority_quantum_scale),
             interval_quantum_ms=10.0 * float(priority_quantum_scale),
@@ -400,11 +554,19 @@ def run_system(
             max_attempts=max_attempts,
             sequence_offset=-1_000_000,
             retry_delay_scale=retry_delay_scale,
+            carry_prior_restart_cost=carry_prior_restart_cost,
             observed_commit_admission=observed_commit_admission,
             policy_commit_batch=policy_commit_batch,
         )
         manager.trajectory_collector.clear()
         manager.reset_measurement_diagnostics()
+        reset_policy = getattr(compiled_policy, "reset", None)
+        if reset_policy is not None:
+            reset_policy()
+    fast_starts_before=manager.native_occ_fast_starts
+    cycle_safe_before=manager.cycle_safe_gate_diagnostics()
+    coordinated_before=manager.coordinated_gate_diagnostics()
+    outcomes_before=manager.runtime_outcome_diagnostics()
     counters, drain_s = run_window(
         manager,
         workload,
@@ -415,10 +577,24 @@ def run_system(
         max_attempts=max_attempts,
         sequence_offset=0,
         retry_delay_scale=retry_delay_scale,
+        carry_prior_restart_cost=carry_prior_restart_cost,
+        record_restart_costs=carry_prior_restart_cost and trajectory_output is not None,
         observed_commit_admission=observed_commit_admission,
         policy_commit_batch=policy_commit_batch,
     )
     if trajectory_output is not None and system == "paper-atcc":
+        helper_accounting = None
+        if helper_externality_accounting:
+            coordinator = manager._coordinated_admission
+            final = coordinator.snapshot()
+            assert not final["owners"] and not final["pending"], "finalize only after reservations drain"
+            totals = coordinator.externalities_snapshot()
+            helper_accounting = dict(recording_active=coordinator.record_externalities,
+                totals_by_owner=totals,
+                reconciliation=manager.trajectory_collector.reconcile_helper_externalities(totals),
+                components_by_transition=manager.trajectory_collector.helper_component_snapshot(),
+                predecision_costs_by_owner=manager.trajectory_collector.helper_predecision_snapshot(),
+                scope="reservation-owner Event-wait segments, not barriers or native waits")
         transitions = [
             {
                 **dataclasses.asdict(transition),
@@ -429,7 +605,10 @@ def run_system(
         ]
         trajectory_output.parent.mkdir(parents=True, exist_ok=True)
         trajectory_output.write_text(
-            json.dumps({"transitions": transitions}, indent=2, sort_keys=True) + "\n",
+            json.dumps({"transitions": transitions,
+                **({"attempt_restart_costs": counters.restart_cost_records} if carry_prior_restart_cost else {}),
+                **({"helper_externalities": helper_accounting}
+                if helper_accounting is not None else {})}, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
     commits = int(counters.commits)
@@ -463,6 +642,11 @@ def run_system(
         "attempts": attempts,
         "aborts": counters.aborts,
         "agent_tps": commits / max(0.001, measure_seconds),
+        "elapsed_task_tps": commits / max(0.001, measure_seconds + drain_s),
+        "abort_rate": counters.aborts / attempts if attempts else 0.0,
+        "task_completion_rate": commits / counters.logical_tasks if counters.logical_tasks else 0.0,
+        "blocked_ms_total": counters.blocked_ms,
+        "lock_hold_ms_total": counters.lock_hold_ms,
         "commit_rate": commits / attempts if attempts else 0.0,
         "p50_latency_ms": percentile(counters.latencies_ms, 0.50),
         "p95_latency_ms": percentile(counters.latencies_ms, 0.95),
@@ -498,6 +682,37 @@ def run_system(
             else "policy_action" if system == "paper-atcc" else "none"
         ),
         "policy_commit_batch": bool(policy_commit_batch),
+        "tracked_history_import": bool(tracked_history_import),
+        "conflict_driven_fast_path": bool(conflict_driven_fast_path),
+        "unified_commit_admission": bool(unified_commit_admission),
+        "cycle_safe_hotspot_admission": bool(cycle_safe_hotspot_admission),
+        "cycle_safe_gate_wait_ms": float(cycle_safe_gate_wait_ms),
+        "cycle_safe_gate_admissions": manager.cycle_safe_gate_diagnostics()["admissions"]-cycle_safe_before["admissions"],
+        "cycle_safe_gate_bypasses": manager.cycle_safe_gate_diagnostics()["bypasses"]-cycle_safe_before["bypasses"],
+        "coordinated_hotspot_admission": bool(coordinated_hotspot_admission),
+        "round_interval_features": bool(round_interval_features),
+        "commit_read_checkpoints": bool(commit_read_checkpoints),
+        "first_access_read_refresh": bool(first_access_read_refresh),
+        "consistent_hotness_classification": bool(consistent_hotness_classification),
+        "helper_externality_accounting": bool(helper_externality_accounting),
+        "observed_write_read_lock_elision": bool(observed_write_read_lock_elision),
+        "protection_relevant_hotness": bool(protection_relevant_hotness),
+        "unique_attempt_outcomes": bool(unique_attempt_outcomes),
+        "carry_prior_restart_cost": bool(carry_prior_restart_cost),
+        "observed_failed_restart_cost_ms_total": counters.observed_failed_restart_cost_ms,
+        "carried_prior_restart_cost_ms_total": counters.carried_prior_restart_cost_ms,
+        **{f"runtime_outcomes_{key}": value-outcomes_before[key]
+           for key, value in manager.runtime_outcome_diagnostics().items()},
+        "helper_externality_recording_active": bool(manager._coordinated_admission is not None
+            and manager._coordinated_admission.record_externalities),
+        "mutable_read_before_reasoning": bool(workload.config.mutable_read_before_reasoning),
+        **{f"coordinated_gate_{key}": manager.coordinated_gate_diagnostics().get(key, 0.)
+           -coordinated_before.get(key, 0.) for key in ("admissions", "cycle_bypasses", "wait_calls",
+              "priority_overtakes", "dependency_probes", "timeouts")},
+        "performance_guards": bool(performance_guards),
+        "native_occ_fast_tasks": manager.native_occ_fast_starts-fast_starts_before,
+        "lazy_baseline_store_reads": manager.version_manager.snapshot_diagnostics().get(
+            "lazy_baseline_store_reads", 0),
         "observed_commit_admission": bool(observed_commit_admission),
         "planned_target_count": 0,
         "error": "",
@@ -517,7 +732,11 @@ def run_window(
     retry_delay_scale: float = 1.0,
     observed_commit_admission: bool = False,
     policy_commit_batch: bool = True,
+    carry_prior_restart_cost: bool = False,
+    record_restart_costs: bool = False,
 ) -> tuple[WindowCounters, float]:
+    if record_restart_costs and not carry_prior_restart_cost:
+        raise ValueError("restart cost records require actual prior-cost propagation")
     counters = WindowCounters()
     started_at = 0.0
     deadline = 0.0
@@ -536,7 +755,10 @@ def run_window(
                 task_id = f"credit-review:{seed}:{worker_id}:{logical_sequence}"
                 task_started = time.perf_counter()
                 committed = False
+                prior_restart_cost = 0.
+                previous_failure_reason = "none"
                 for attempt in range(max_attempts):
+                    attempt_diagnostics = {} if carry_prior_restart_cost else None
                     result, execution = execute_attempt(
                         manager,
                         workload,
@@ -547,15 +769,28 @@ def run_window(
                         retry_delay_scale=retry_delay_scale,
                         observed_commit_admission=observed_commit_admission,
                         policy_commit_batch=policy_commit_batch,
+                        **({"prior_retry_cost_ms": prior_restart_cost,
+                            "previous_failure_reason": previous_failure_reason,
+                            "attempt_diagnostics": attempt_diagnostics} if carry_prior_restart_cost else {}),
                     )
                     counters.record_attempt(
                         committed=bool(result.committed),
                         execution=execution,
                         failure_reason=str(result.reason),
+                        observed_restart_cost_ms=(attempt_diagnostics['restart_cost_ms']
+                            if carry_prior_restart_cost else 0.),
+                        carried_prior_restart_cost_ms=prior_restart_cost,
+                        restart_cost_record=(dict(attempt_diagnostics, task_id=task_id, attempt=attempt,
+                            prior_restart_cost_ms=prior_restart_cost, previous_failure_reason=previous_failure_reason,
+                            committed=bool(result.committed), failure_reason=str(result.reason))
+                            if record_restart_costs else None),
                     )
                     if result.committed:
                         committed = True
                         break
+                    if carry_prior_restart_cost:
+                        prior_restart_cost += attempt_diagnostics['restart_cost_ms']
+                        previous_failure_reason = str(result.reason)
                 latency_ms = (time.perf_counter() - task_started) * 1000.0
                 counters.record_task(committed=committed, latency_ms=latency_ms)
                 if system == "paper-atcc":
@@ -594,7 +829,13 @@ def execute_attempt(
     retry_delay_scale: float = 1.0,
     observed_commit_admission: bool = False,
     policy_commit_batch: bool = True,
+    prior_retry_cost_ms: float | None = None,
+    previous_failure_reason: str | None = None,
+    attempt_diagnostics: dict[str, Any] | None = None,
 ) -> tuple[Any, CreditReviewExecution]:
+    if prior_retry_cost_ms is not None and (
+            not math.isfinite(prior_retry_cost_ms) or prior_retry_cost_ms < 0.):
+        raise ValueError("prior retry cost must be finite observed nonnegative work")
     sleep_for_reasoning(
         credit_retry_delay_ms(
             task_id=task_id,
@@ -608,6 +849,10 @@ def execute_attempt(
         observed_commit_admission=observed_commit_admission,
         policy_commit_batch=policy_commit_batch,
     )
+    if prior_retry_cost_ms is not None:
+        metadata['prior_retry_cost_ms'] = float(prior_retry_cost_ms)
+    if previous_failure_reason is not None:
+        metadata['previous_failure_reason'] = str(previous_failure_reason)
     txn = manager.begin(task_id, metadata, snapshot_object_ids=None, strategy=system)
     cursor = workload.cursor(task)
     try:
@@ -622,21 +867,34 @@ def execute_attempt(
             ),
         )
         result = txn.commit(system)
-        return result, execution
+        return result, dataclasses.replace(execution, blocked_ms=txn.context.blocked_time_ms,
+                                          lock_hold_ms=txn.context.lock_hold_time_ms)
     except LockConflict as exc:
         if txn.result is not None:
-            return txn.result, cursor.snapshot()
+            return txn.result, dataclasses.replace(cursor.snapshot(), blocked_ms=txn.context.blocked_time_ms,
+                                                  lock_hold_ms=txn.context.lock_hold_time_ms)
         result = txn.abort(
             exc.reason,
             strategy=system,
             conflict_object_ids=exc.targets,
         )
-        return result, cursor.snapshot()
+        return result, dataclasses.replace(cursor.snapshot(), blocked_ms=txn.context.blocked_time_ms,
+                                          lock_hold_ms=txn.context.lock_hold_time_ms)
     except BaseException:
         if txn.result is None:
             with contextlib.suppress(BaseException):
                 txn.abort("credit-review execution error", strategy=system)
         raise
+    finally:
+        if attempt_diagnostics is not None:
+            # This is completed post-begin work from the real attempt, not its
+            # requested budget, future retry sleep, lock wait or a fake cost.
+            agent_cost = float(txn.context.agent_cost_ms)
+            operation_cost = float(txn.context.operation_cost_ms)
+            if not all(math.isfinite(value) and value >= 0. for value in (agent_cost, operation_cost)):
+                raise ValueError("invalid observed attempt restart cost")
+            attempt_diagnostics.update(agent_cost_ms=agent_cost, operation_cost_ms=operation_cost,
+                                       restart_cost_ms=agent_cost+operation_cost, txn_id=txn.context.tid)
 
 
 def credit_retry_delay_ms(
@@ -711,16 +969,11 @@ def acquire_policy_commit_batch(
     txn: Any,
     targets: tuple[str, ...],
 ) -> float:
-    snapshots = {
-        target: manager.hotness_tracker.object_snapshot(target)
-        for target in {str(value) for value in targets}
-    }
     protected = tuple(
         sorted(
             target
-            for target, snapshot in snapshots.items()
-            if int(snapshot.get("conflicts", 0) or 0) >= 2
-            or int(snapshot.get("lock_wait_events", 0) or 0) >= 2
+            for target in {str(value) for value in targets}
+            if manager.hotness_tracker.commit_admission_needed(target)
         )
     )
     if not protected:

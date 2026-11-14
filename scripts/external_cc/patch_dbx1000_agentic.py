@@ -22,6 +22,12 @@ CONFIG_BLOCK = r"""
 // 0=low, 1=medium, 2=high
 #define CASTDAS_AGENT_LEVEL          0
 #define CASTDAS_REASONING_SCALE      1.0
+#define CASTDAS_TRACE_EXPLORE_LO_MS  0
+#define CASTDAS_TRACE_EXPLORE_HI_MS  0
+#define CASTDAS_TRACE_REFINE_LO_MS   0
+#define CASTDAS_TRACE_REFINE_HI_MS   0
+#define CASTDAS_TRACE_COMMIT_LO_MS   0
+#define CASTDAS_TRACE_COMMIT_HI_MS   0
 #define CASTDAS_RECORD_AGENT_STATS   true
 """
 
@@ -43,6 +49,14 @@ AGENTIC_HEADER = r"""#pragma once
 #endif
 #ifndef CASTDAS_REASONING_SCALE
 #define CASTDAS_REASONING_SCALE 1.0
+#endif
+#ifndef CASTDAS_TRACE_EXPLORE_LO_MS
+#define CASTDAS_TRACE_EXPLORE_LO_MS 0
+#define CASTDAS_TRACE_EXPLORE_HI_MS 0
+#define CASTDAS_TRACE_REFINE_LO_MS 0
+#define CASTDAS_TRACE_REFINE_HI_MS 0
+#define CASTDAS_TRACE_COMMIT_LO_MS 0
+#define CASTDAS_TRACE_COMMIT_HI_MS 0
 #endif
 #ifndef CASTDAS_RECORD_AGENT_STATS
 #define CASTDAS_RECORD_AGENT_STATS true
@@ -123,6 +137,17 @@ static inline uint32_t castdas_base_delay_ms(
     }
   }
   uint32_t picked = castdas_range_pick(low, high, tid, txn_id, attempt, phase);
+  // Optional live-trace-derived IQR. The retry delay remains synthetic because
+  // a single-worker capture does not observe conflict-induced retries.
+  if (phase == CASTDAS_PHASE_EXPLORE && CASTDAS_TRACE_EXPLORE_LO_MS > 0)
+    picked = castdas_range_pick(CASTDAS_TRACE_EXPLORE_LO_MS,
+        CASTDAS_TRACE_EXPLORE_HI_MS, tid, txn_id, attempt, phase);
+  if (phase == CASTDAS_PHASE_REFINE && CASTDAS_TRACE_REFINE_LO_MS > 0)
+    picked = castdas_range_pick(CASTDAS_TRACE_REFINE_LO_MS,
+        CASTDAS_TRACE_REFINE_HI_MS, tid, txn_id, attempt, phase);
+  if (phase == CASTDAS_PHASE_COMMIT && CASTDAS_TRACE_COMMIT_LO_MS > 0)
+    picked = castdas_range_pick(CASTDAS_TRACE_COMMIT_LO_MS,
+        CASTDAS_TRACE_COMMIT_HI_MS, tid, txn_id, attempt, phase);
   double scaled = ((double) picked) * ((double) CASTDAS_REASONING_SCALE);
   if (scaled <= 0.0)
     return 0;
@@ -181,9 +206,47 @@ def patch_repo(repo: Path, *, compat: bool, compiler: str = "") -> None:
     patch_stats_cpp(repo / "system" / "stats.cpp")
     patch_thread(repo / "system" / "thread.cpp")
     patch_txn(repo / "system" / "txn.cpp")
+    patch_hekaton_declaration(repo / "system" / "txn.h")
+    patch_hekaton_stats_typo(repo / "concurrency_control" / "hekaton.cpp")
+    patch_hekaton_txn_compilation(repo / "system" / "txn.cpp")
     patch_makefile(repo / "Makefile", compat=compat, compiler=compiler)
     if compat:
         patch_static_asserts(repo / "config-std.h")
+
+
+def patch_hekaton_declaration(path: Path) -> None:
+    """Fix an upstream macro typo in a disposable checkout, not CC semantics."""
+    text = path.read_text()
+    updated = re.sub(r"(#elif\s+CC_ALG\s*==\s*)Hekaton\b", r"\1HEKATON", text)
+    if updated != text:
+        path.write_text(updated)
+
+
+def patch_hekaton_stats_typo(path: Path) -> None:
+    """Drop a stale, zero-length debug timer using an undefined stats field."""
+    text = path.read_text()
+    snippet = (
+        "\tuint64_t starttime = get_sys_clock();\n"
+        "\tINC_STATS(get_thd_id(), debug1, get_sys_clock() - starttime);\n"
+    )
+    if snippet in text:
+        path.write_text(text.replace(snippet, "", 1))
+
+
+def patch_hekaton_txn_compilation(path: Path) -> None:
+    """Repair two upstream HEKATON-only type/guard compile defects."""
+    text = path.read_text()
+    updated = text.replace(
+        "    access_marker = 0;\n    return;\n#endif",
+        "#if CC_ALG == IC3\n    access_marker = 0;\n#endif\n    return;\n#endif",
+        1,
+    ).replace(
+        "accesses[row_cnt]->history_entry = history_entry;",
+        "accesses[row_cnt]->history_entry = const_cast<void *>(history_entry);",
+        1,
+    )
+    if updated != text:
+        path.write_text(updated)
 
 
 def normalize_schema_line_endings(repo: Path) -> None:
@@ -221,12 +284,23 @@ def patch_stats(path: Path) -> None:
         "  TMP_METRICS(x, y)"
     )
     if needle not in text:
-        raise SystemExit(f"cannot patch ALL_METRICS in {path}")
+        legacy = "\tuint64_t abort_cnt;\n"
+        if legacy not in text:
+            raise SystemExit(f"cannot patch ALL_METRICS in {path}")
+        fields = "".join(f"\tuint64_t {name};\n" for name in (
+            "castdas_agent_txn_cnt", "castdas_agent_abort_cnt", "castdas_background_txn_cnt",
+            "castdas_background_abort_cnt", "castdas_agent_delay_ns"))
+        path.write_text(text.replace(legacy, legacy + fields, 1))
+        return
     path.write_text(text.replace(needle, repl, 1))
 
 
 def patch_stats_cpp(path: Path) -> None:
     text = path.read_text()
+    if "void Stats_thd::clear()" in text and "castdas_agent_txn_cnt = 0" not in text:
+        text = text.replace("\tabort_cnt = 0;", "\tabort_cnt = 0;\n" + "".join(
+            f"\t{name} = 0;\n" for name in ("castdas_agent_txn_cnt", "castdas_agent_abort_cnt",
+            "castdas_background_txn_cnt", "castdas_background_abort_cnt", "castdas_agent_delay_ns")), 1)
     if "CASTDAS stdout latency distribution" in text:
         return
     old = (
@@ -281,9 +355,9 @@ def patch_thread(path: Path) -> None:
             "                    ((uint64_t) castdas_pre_delay_ms) * 1000000UL);\n"
             "#endif\n"
         )
-        if needle not in text:
+        text, count = re.subn(r"\t\tif \(rc == RCOK\)[ \t]*\n\t\t\{\n", lambda _: repl, text, count=1)
+        if count != 1:
             raise SystemExit(f"cannot find transaction execution block in {path}")
-        text = text.replace(needle, repl, 1)
 
     if "castdas_agent_txn_cnt" not in text:
         bad_latency_block = (
@@ -308,6 +382,10 @@ def patch_thread(path: Path) -> None:
                 text,
                 count=1,
             )
+            if count != 1:
+                text, count = re.subn(
+                    r"([ \t]*INC_STATS\(get_thd_id\(\), latency, timespan\);\n)",
+                    latency_repl, text, count=1)
             if count != 1:
                 raise SystemExit(f"cannot find commit latency counter in {path}")
 
@@ -366,7 +444,7 @@ def patch_thread(path: Path) -> None:
             r"\1"
         )
         text, count = re.subn(
-            r"([ \t]*m_txn->abort_cnt\+\+;\n)",
+            r"([ \t]*m_txn->abort_cnt\s*\+\+;\n)",
             retry_repl,
             text,
             count=1,
@@ -379,6 +457,9 @@ def patch_thread(path: Path) -> None:
 
 def patch_txn(path: Path) -> None:
     text = path.read_text()
+    # Legacy upstream uses per-benchmark commit delay; do not double-delay it.
+    if '"row_bamboo.h"' not in text and "\tuint64_t starttime" in text:
+        return
     if '"castdas_agentic.h"' not in text:
         text = text.replace('#include "row_bamboo.h"\n', '#include "row_bamboo.h"\n#include "castdas_agentic.h"\n', 1)
     if "castdas_commit_delay_ms" not in text:

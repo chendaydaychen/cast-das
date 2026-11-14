@@ -5,6 +5,8 @@ from __future__ import annotations
 import dataclasses
 import contextlib
 import threading
+import time
+from collections import deque
 from typing import Iterable
 
 
@@ -30,6 +32,7 @@ class _ObjectHeat:
     lock_wait_events: int = 0
     lock_wait_ms: float = 0.0
     wounds: int = 0
+    recent_access_ns: deque[int] = dataclasses.field(default_factory=deque)
 
 
 class HotnessTracker:
@@ -50,6 +53,7 @@ class HotnessTracker:
         with self._locks[index]:
             heat = self._objects[index].setdefault(key, _ObjectHeat())
             heat.accesses += 1
+            heat.recent_access_ns.append(time.monotonic_ns())
             self._accesses[index] += 1
             return self._is_hot(
                 heat,
@@ -57,6 +61,23 @@ class HotnessTracker:
                 len(self._objects[index]),
                 access_share_scale=len(self._objects),
             )
+
+    def recent_access_count(self, object_id: str, *, window_ms: float) -> int:
+        """Count actual observed accesses to one key in a trailing time window.
+
+        This is intentionally a tiny statistic for the reviewer-requested
+        frequency-only rule.  Offline priming never enters this queue.
+        """
+        key = str(object_id)
+        index = self._shard_index(key)
+        cutoff = time.monotonic_ns() - int(max(0.0, float(window_ms)) * 1_000_000)
+        with self._locks[index]:
+            heat = self._objects[index].get(key)
+            if heat is None:
+                return 0
+            while heat.recent_access_ns and heat.recent_access_ns[0] < cutoff:
+                heat.recent_access_ns.popleft()
+            return len(heat.recent_access_ns)
 
     def prime_accesses(self, object_ids: Iterable[str]) -> None:
         """Load a read-only workload-frequency prior before execution starts."""
@@ -200,7 +221,14 @@ class HotnessTracker:
         with self._locks[index]:
             heat = self._objects[index].get(key, _ObjectHeat())
             return {
-                **dataclasses.asdict(heat),
+                # All heat fields are numeric scalars. Avoid recursive
+                # dataclass/deepcopy machinery inside the shard latch.
+                "accesses": heat.accesses,
+                "conflicts": heat.conflicts,
+                "validation_failures": heat.validation_failures,
+                "lock_wait_events": heat.lock_wait_events,
+                "lock_wait_ms": heat.lock_wait_ms,
+                "wounds": heat.wounds,
                 "hot": self._is_hot(
                     heat,
                     self._accesses[index],
@@ -208,6 +236,19 @@ class HotnessTracker:
                     access_share_scale=len(self._objects),
                 ),
             }
+
+    def commit_admission_needed(self, object_id: str) -> bool:
+        """Exact legacy admission predicate, without unused heat snapshots.
+
+        Read the same two counters under the same shard latch. This neither
+        samples nor caches metadata and does not change hotspot classification.
+        """
+        key = str(object_id)
+        index = self._shard_index(key)
+        with self._locks[index]:
+            heat = self._objects[index].get(key)
+            return bool(heat is not None and (
+                heat.conflicts >= 2 or heat.lock_wait_events >= 2))
 
     def _shard_index(self, object_id: str) -> int:
         return hash(str(object_id)) % len(self._objects)

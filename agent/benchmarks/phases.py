@@ -19,6 +19,19 @@ class ReasoningProfile:
     def delay_ms(self, *, level: str, phase: str, task_id: str, attempt: int) -> int:
         if self.name in {"none", "off", "disabled"}:
             return 0
+        # Median delays measured from the real CreditCrew HTTP collection.
+        # This profile is used when replaying the same agent trace through
+        # YCSB/TPCC-shaped workloads; it keeps the phase boundary intact while
+        # replacing the synthetic 1--50 ms delay with the observed LLM delay.
+        if self.name in {"credit_real", "creditcrew", "real_credit"}:
+            measured = {"explore": 3161, "refine": 2933, "commit": 0}
+            base = int(measured.get(str(phase).strip().lower(), 0))
+            if base <= 0:
+                return 0
+            # Keep deterministic per-task variation small so every replay has
+            # the same measured latency scale without adding a random seed.
+            jitter = deterministic_int(-80, 80, "|".join((self.name, task_id, str(attempt), str(phase))))
+            return max(0, int(round(base * self.scale)) + jitter)
         reasoning_level = "high" if self.name in {"agentic", "heavy", "long"} else level
         low, high = delay_range_ms(level=reasoning_level, phase=phase)
         if self.name in {"light", "short"}:
@@ -122,7 +135,10 @@ def plan_task_phases(
     level = str(context.get("level", "low"))
     operations_by_phase = phase_operations(task)
     operation_indexes = {id(operation): index for index, operation in enumerate(task.operations)}
-    paper_timing = str(context.get("profile", "small")).strip().lower() == "paper"
+    paper_timing = (
+        str(context.get("profile", "small")).strip().lower() == "paper"
+        and profile.name not in {"credit_real", "creditcrew", "real_credit"}
+    )
     if paper_timing:
         phases = tuple(
             PlannedPhase(

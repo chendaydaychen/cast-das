@@ -36,7 +36,8 @@ class VersionManager:
     every object in the batch visible together.
     """
 
-    def __init__(self, store: Any, *, max_commit_states: int = 4096):
+    def __init__(self, store: Any, *, max_commit_states: int = 4096,
+                 tracked_history_import: bool = False):
         self.store = store
         self._lock = threading.RLock()
         self._boundary_condition = threading.Condition(threading.RLock())
@@ -59,6 +60,11 @@ class VersionManager:
         self._last_agent_commit_epoch: dict[str, int] = {}
         self._background_version_changes: dict[str, int] = {}
         self._dirty_objects: set[str] = set()
+        # Opt-in contract: after bootstrap, every physical write is published
+        # through this manager (or explicitly synchronized). The reference path
+        # continues inspecting all coverage for callers with out-of-band writes.
+        self.tracked_history_import = bool(tracked_history_import)
+        self._stale_native_history: set[str] = set()
         self._operations_since_gc = 0
         self._gc_interval = 256
         self._max_commit_states = max(64, int(max_commit_states))
@@ -79,6 +85,7 @@ class VersionManager:
             "object_boundary_waits": 0,
             "pinned_read_guard_acquires": 0,
             "pinned_read_guard_conflicts": 0,
+            "lazy_baseline_store_reads": 0,
         }
 
     def register_object(self, object_id: str) -> None:
@@ -123,6 +130,26 @@ class VersionManager:
     def current_epoch(self) -> int:
         with self._lock:
             return int(self._epoch)
+
+    def certify_common_read_epoch(self, versions: dict[str, int], *, not_before_epoch: int) -> int | None:
+        """Prove all observed versions coexist at an epoch during this task.
+
+        Read-only certification only: callers must reject any write set. Missing
+        history or an out-of-band physical version conservatively returns None.
+        A version change alone is harmless; disjoint validity intervals are not.
+        """
+        with self._lock:
+            lower=max(0,int(not_before_epoch));upper=int(self._epoch)
+            for object_id,version in versions.items():
+                key=str(object_id);history=self._history.get(key,())
+                if (not history or key in self._stale_native_history
+                        or int(self.store.get(key).version)!=history[-1].version):return None
+                index=next((i for i,row in enumerate(history) if row.version==int(version)),None)
+                if index is None:return None
+                lower=max(lower,history[index].commit_epoch)
+                if index+1<len(history):upper=min(upper,history[index+1].commit_epoch-1)
+                if lower>upper:return None
+            return lower if lower<=upper else None
 
     def has_lazy_pins(self, object_ids: Iterable[str] | None = None) -> bool:
         with self._lock:
@@ -311,6 +338,29 @@ class VersionManager:
                                 background=True,
                             )
                         ]
+                if not materialized:
+                    # A retry preloads only its known conflicts, but the lazy
+                    # pin may subsequently read ANY object in its coverage.
+                    # Native fast commits intentionally do not maintain history.
+                    # Establish every covered object's current baseline before
+                    # publishing the pin; otherwise a later snapshot refresh can
+                    # replace stale history and erase the retry's visible value.
+                    for covered in coverage:
+                        if covered in result:
+                            continue
+                        if (self.tracked_history_import
+                                and covered not in self._stale_native_history
+                                and covered in self._history):
+                            continue
+                        current = self.store.get(covered)
+                        self._diagnostics["lazy_baseline_store_reads"] += 1
+                        versions = self._history.get(covered, ())
+                        if not versions or versions[-1].version != int(current.version):
+                            self._history.setdefault(covered, []).append(
+                                CommittedVersion(covered, str(current.value), int(current.version),
+                                    bool(current.exists), epoch, "lazy-retry-baseline", False)
+                            )
+                        self._stale_native_history.discard(covered)
                 self._set_pin_locked(
                     pin_tid,
                     epoch,
@@ -349,7 +399,12 @@ class VersionManager:
             with self._lock:
                 epoch = int(self._epoch)
                 for object_id in keys:
+                    if (self.tracked_history_import
+                            and object_id not in self._stale_native_history
+                            and object_id in self._history):
+                        continue
                     current = self.store.get(object_id)
+                    self._diagnostics["lazy_baseline_store_reads"] += 1
                     versions = self._history.get(object_id, ())
                     if not versions or versions[-1].version != int(current.version):
                         self._history.setdefault(object_id, []).append(
@@ -363,6 +418,7 @@ class VersionManager:
                                 background=False,
                             )
                         )
+                    self._stale_native_history.discard(object_id)
                 self._set_pin_locked(
                     key,
                     epoch,
@@ -609,6 +665,8 @@ class VersionManager:
                             or self._lazy_pin_object_counts.get(object_id, 0)
                         )
                         if background and not preserve_history:
+                            if self.tracked_history_import:
+                                self._stale_native_history.add(object_id)
                             continue
                         if published_version is None:
                             current = self.store.get(object_id)
@@ -638,6 +696,7 @@ class VersionManager:
                             self._history[object_id] = [committed]
                         if not background:
                             self._last_agent_commit_epoch[object_id] = commit_epoch
+                        self._stale_native_history.discard(object_id)
                     self._diagnostics["atomic_publishes"] += 1
                     self._diagnostics["published_objects"] += len(write_rows)
                 self._private.pop(key, None)
@@ -999,20 +1058,26 @@ class VersionManager:
         background: bool,
         background_sample_rate: int,
     ) -> None:
-        with self._boundary_condition:
-            self._active_publications.pop(int(boundary), None)
-            if self._boundary_waiters:
-                self._boundary_condition.notify_all()
-        if not committed:
-            return
-        sample_rate = int(background_sample_rate)
-        if background and sample_rate <= 0:
-            return
-        weight = max(1, sample_rate) if background else 1
-        with self._lock:
-            self._diagnostics["native_publishes"] += weight
-            if background:
-                self._note_background_version_changes_locked(
-                    object_ids,
-                    weight=weight,
-                )
+        try:
+            if committed:
+                sample_rate = int(background_sample_rate)
+                sampled = not background or sample_rate > 0
+                if self.tracked_history_import or sampled:
+                    # Record invalidation BEFORE releasing the reservation.
+                    # Sampling diagnostics must never sample correctness state.
+                    with self._lock:
+                        if self.tracked_history_import:
+                            self._stale_native_history.update(object_ids)
+                        if sampled:
+                            weight = max(1, sample_rate) if background else 1
+                            self._diagnostics["native_publishes"] += weight
+                            if background:
+                                self._note_background_version_changes_locked(
+                                    object_ids, weight=weight)
+        finally:
+            # Do not acquire the boundary condition while holding _lock: native
+            # admission takes these latches in the opposite order.
+            with self._boundary_condition:
+                self._active_publications.pop(int(boundary), None)
+                if self._boundary_waiters:
+                    self._boundary_condition.notify_all()

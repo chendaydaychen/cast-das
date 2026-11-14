@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from decimal import Decimal, InvalidOperation
 import os
 import re
 import shutil
@@ -100,6 +101,7 @@ FIELDS = [
     "user_abort_cnt",
     "run_seconds",
     "error",
+    "native_trace_field_fidelity",
 ]
 
 
@@ -112,9 +114,16 @@ def main() -> int:
     parser.add_argument("--run-timeout", type=float, default=120.0)
     parser.add_argument("--patch-agentic", type=Path, default=ROOT / "scripts" / "external_cc" / "patch_dbx1000_agentic.py")
     parser.add_argument("--patch-trace", type=Path, default=Path(__file__).with_name("patch_dbx1000_trace_replay.py"))
+    fidelity = parser.add_mutually_exclusive_group()
+    fidelity.add_argument('--require-trace-field-fidelity',action='store_true',
+        help='Explicitly request the default strict field gate; not a full protocol-equivalence proof')
+    fidelity.add_argument('--allow-lossy-trace-projection',action='store_true',
+        help='Legacy projection pilot only: explicitly allow moved waits/lost values, recorded in results')
     args = parser.parse_args()
 
     trace_rows = read_trace(args.trace)
+    if not args.allow_lossy_trace_projection:
+        require_trace_field_fidelity(trace_rows)
     output_rows = []
     for system in split_csv(args.systems):
         meta = SYSTEMS[system]
@@ -133,12 +142,21 @@ def read_trace(path: Path) -> list[dict[str, str]]:
 
 
 def prepare_repo(root: Path, system: str, meta: dict, patch_agentic: Path, patch_trace: Path) -> Path:
-    src = root / meta["source_dir"]
-    dst = root / meta["work_dir"]
-    if not src.exists():
+    root = root.resolve()
+    src = (root / meta["source_dir"]).resolve()
+    destination = root / meta["work_dir"]
+    dst = destination.resolve()
+    for label, path in (("source", src), ("destination", dst)):
+        if path == root or root not in path.parents:
+            raise ValueError(f"native {label} must be strictly inside root: {path}")
+    if src == dst or src in dst.parents or dst in src.parents:
+        raise ValueError(f"native source and destination must not overlap: {src}, {dst}")
+    if not src.is_dir():
         raise SystemExit(f"missing external repo for {system}: {src}")
-    if dst.exists():
-        shutil.rmtree(str(dst))
+    # Never erase a previous build, experiment, or dangling symlink.  copytree
+    # also refuses a destination created after this check (no dirs_exist_ok).
+    if os.path.lexists(destination):
+        raise FileExistsError(f"refusing to overwrite native workspace: {destination}; use a fresh root")
     ignore = shutil.ignore_patterns(".git", "outputs", "log", "*.o", "*.d", "rundb", "temp.out")
     shutil.copytree(str(src), str(dst), ignore=ignore)
     (dst / "outputs").mkdir(exist_ok=True)
@@ -192,6 +210,7 @@ def run_one(
     log_dir.mkdir(parents=True, exist_ok=True)
     (log_dir / f"{system}_{meta['alg']}_{sample['trace_id']}.log").write_text(out)
     row = base_row(sample, system, meta["alg"])
+    row['native_trace_field_fidelity']=json.dumps(trace_stats['trace_field_fidelity'],sort_keys=True)
     txn_cnt = number(parsed.get("txn_cnt"))
     abort_cnt = number(parsed.get("abort_cnt"))
     agent_commits = number(parsed.get("castdas_agent_txn_cnt"))
@@ -298,7 +317,59 @@ def run_one(
     return row
 
 
-def write_dbx1000_trace(path: Path, rows: list[dict[str, str]]) -> dict[str, int]:
+def legacy_trace_field_fidelity(rows):
+    """Expose projections in this legacy codec, never label them exact replay."""
+    moved_operation_rows=0;moved_aggregate_rows=0;retry_rows=0;write_rows=0;unsupported_rows=0
+    numeric_rows=0
+    def unsigned_integer(value, maximum):
+        try:
+            numeric=Decimal(str(value))
+            return not isinstance(value,bool) and numeric.is_finite() and 0<=numeric<=maximum and numeric==numeric.to_integral_value()
+        except (TypeError, ValueError, OverflowError, InvalidOperation):
+            return False
+    for row in rows:
+        ops=json.loads(row['ops_json'])
+        unsupported_rows+=not ops or any(op.get('kind') not in ('read','write') for op in ops)
+        moved_operation_rows+=any(float(op.get('delay_ms') or 0)>0 for op in ops)
+        moved_aggregate_rows+=any(float(row.get(p+'_delay_ms') or 0)>0 for p in ('refine','commit'))
+        retry=json.loads(row.get('retry_delays_json') or '[]')
+        scalar=float(row.get('retry_delay_ms') or 0)
+        times=[row.get(p+'_delay_ms') or 0 for p in ('explore','refine','commit','retry')]
+        times.extend(op.get('delay_ms') or 0 for op in ops)
+        times.extend(retry)
+        numeric_rows+=bool(any(not unsigned_integer(v,2**32-1) for v in times) or
+            any(not unsigned_integer(op.get('key'),2**64-1) for op in ops))
+        # Legacy native execution never pays a retry delay before attempt0.
+        # A source trace may explicitly request one; do not certify it exact.
+        retry_rows+=bool((retry and float(retry[0])!=0) or
+            any(float(value)!=scalar for value in retry[1:]))
+        write_rows+=any(op['kind']=='write' for op in ops)
+    return dict(codec='legacy-pre-and-commit-aggregated-key-op-only',
+        nonempty_trace=bool(rows),
+        rows_with_moved_operation_waits=moved_operation_rows,
+        rows_with_moved_phase_waits=moved_aggregate_rows,
+        rows_with_lost_retry_sequence=retry_rows,rows_with_untransferred_write_values=write_rows,
+        rows_with_unsupported_or_empty_accesses=unsupported_rows,
+        rows_with_unrepresentable_numeric_fields=numeric_rows,
+        preserves_numeric_fields=not numeric_rows,
+        preserves_supported_access_tokens=not unsupported_rows,
+        preserves_operation_wait_placement=not(moved_operation_rows or moved_aggregate_rows),
+        preserves_per_attempt_retry_sequence=not retry_rows,
+        transfers_requested_write_values=not write_rows,
+        token_accounting='estimated operation units, not observed API token usage',
+        scope='Trace field projection only; not native transaction/retry-budget/protocol equivalence')
+
+
+def require_trace_field_fidelity(rows):
+    report=legacy_trace_field_fidelity(rows)
+    if not all(report[key] for key in ('preserves_operation_wait_placement',
+            'preserves_per_attempt_retry_sequence','transfers_requested_write_values',
+            'preserves_supported_access_tokens','preserves_numeric_fields','nonempty_trace')):
+        raise ValueError('Legacy native trace codec cannot preserve requested fields: '+json.dumps(report,sort_keys=True))
+    return report
+
+
+def write_dbx1000_trace(path: Path, rows: list[dict[str, str]]) -> dict[str, object]:
     max_key = 0
     max_ops = 0
     total_agent_delay = 0
@@ -370,6 +441,7 @@ def write_dbx1000_trace(path: Path, rows: list[dict[str, str]]) -> dict[str, int
                 + "\n"
             )
     return {
+        'trace_field_fidelity':legacy_trace_field_fidelity(rows),
         "max_key": max_key,
         "table_size": max_key + 1,
         "max_ops": max_ops,
